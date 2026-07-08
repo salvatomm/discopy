@@ -274,9 +274,10 @@ G = pregroup.Functor(
     cod=Int(D))
 
 ALB_trace = (A @ S @ B >> L).trace(left=True).trace(left=False).foliation()
+G_sentence = G(sentence)
 
 with D.hypergraph_equality:
-  assert G(sentence).inside == ALB_trace
+  assert G_sentence.inside == ALB_trace
 
 Equation(sentence.foliation(), ALB_trace, symbol="$\\mapsto$").draw()
 ```

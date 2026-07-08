@@ -145,6 +145,7 @@ pythonpath = [
 ]
 testpaths = [
     "discopy",
+    "test/readme.py",
     "test/*/*.py",
     "docs/notebooks/*.ipynb",
 ]
