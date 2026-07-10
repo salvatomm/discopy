@@ -132,11 +132,13 @@ or by calling the method `Diagram.foliation` which will minimize the length of t
 
 crack_two_eggs_at_once = crack_two_eggs.foliation()
 
+empty = Ingredient()
+
 assert crack_two_eggs_at_once == Recipe(
   dom=egg @ egg, cod=white @ yolk, inside=(
-    Layer(Ingredient(), crack, Ingredient(), crack, Ingredient()),
+    Layer(empty, crack, empty, crack, empty),
     Layer(white, CookingSwap(yolk, white), yolk),
-    Layer(Ingredient(), merge(white), Ingredient(), merge(yolk), Ingredient())))
+    Layer(empty, merge(white), empty, merge(yolk), empty)))
 
 crack_two_eggs_at_once.draw()
 ```
