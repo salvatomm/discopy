@@ -83,7 +83,7 @@ class CookingStep(Box, Recipe):
 class CookingSwap(Swap, CookingStep):
   "A cooking swap takes two ingredients `X @ Y` and gives `Y @ X`."
 
-Recipe.swap_factory = CookingSwap  # Recipes need to know how to swap.
+Recipe.braid_factory = CookingSwap  # Recipes need to know how to swap.
 
 egg, white, yolk = Ingredient("egg"), Ingredient("white"), Ingredient("yolk")
 crack = CookingStep("crack", egg, white @ yolk)
@@ -134,9 +134,9 @@ crack_two_eggs_at_once = crack_two_eggs.foliation()
 
 assert crack_two_eggs_at_once == Recipe(
   dom=egg @ egg, cod=white @ yolk, inside=(
-    Layer(Ty(), crack, Ty(), crack, Ty()),
+    Layer(Ingredient(), crack, Ingredient(), crack, Ingredient()),
     Layer(white, CookingSwap(yolk, white), yolk),
-    Layer(Ty(), merge(white), Ty(), merge(yolk), Ty())))
+    Layer(Ingredient(), merge(white), Ingredient(), merge(yolk), Ingredient())))
 
 crack_two_eggs_at_once.draw()
 ```
