@@ -1,9 +1,12 @@
 <!--
 Thank you for contributing to DisCoPy! See CONTRIBUTING.md for our philosophy, code style guide and LLM guidelines.
+-->
 
-Please add a short description that was either written by a human or that quotes a human's prompt verbatim.
+## Why
 
-The detailed description can be LLM-generated.
+<!--
+A short high-level explanation of why we're doing this e.g. links to an issue.
+Note: this part should be written by a human or quoting a human's prompt verbatim.
 -->
 
 ## What
