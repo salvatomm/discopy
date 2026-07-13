@@ -236,6 +236,32 @@ class HopfAlgebra:
         """
         Whether ``R`` is a universal R-matrix: it intertwines ``comult`` with
         its opposite and satisfies the two hexagon equations.
+
+        >>> from discopy.drawing import Equation
+        >>> swap = Swap(ob, ob)
+        >>> intertwiner = Equation(
+        ...     rmatrix @ comult >> ob @ swap @ ob >> mult @ mult,
+        ...     (comult >> swap) @ rmatrix >> ob @ swap @ ob >> mult @ mult)
+        >>> intertwiner.draw(path='docs/_static/hopf/quasitriangular.png')
+
+        .. image:: /_static/hopf/quasitriangular.png
+            :align: center
+
+        >>> hexagon1 = Equation(
+        ...     rmatrix >> comult @ ob,
+        ...     rmatrix @ rmatrix >> ob @ swap @ ob >> ob @ ob @ mult)
+        >>> hexagon1.draw(path='docs/_static/hopf/hexagon1.png')
+
+        .. image:: /_static/hopf/hexagon1.png
+            :align: center
+
+        >>> hexagon2 = Equation(
+        ...     rmatrix >> ob @ comult,
+        ...     rmatrix @ rmatrix >> ob @ swap @ ob >> mult @ ob @ ob >> ob @ swap)
+        >>> hexagon2.draw(path='docs/_static/hopf/hexagon2.png')
+
+        .. image:: /_static/hopf/hexagon2.png
+            :align: center
         """
         if self.R is None:
             return False
