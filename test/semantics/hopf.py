@@ -25,6 +25,21 @@ def test_double_is_quasitriangular_hopf_algebra():
         assert D.is_quasitriangular()
 
 
+def test_commutativity_properties():
+    # D(Z/2) is commutative and cocommutative; Sweedler's H4 is neither.
+    D = HopfAlgebra.cyclic(2).double()
+    assert D.is_commutative() and D.is_cocommutative()
+    H4 = HopfAlgebra.sweedler()
+    assert not H4.is_commutative() and not H4.is_cocommutative()
+
+
+def test_element_helpers():
+    Z2 = HopfAlgebra.cyclic(2)
+    x = np.array([0, 1.])                  # the generator g
+    assert np.allclose(Z2.prod(x, x), Z2.unit)         # g . g = 1
+    assert np.allclose(Z2.coprod(x), np.outer(x, x))   # Delta(g) = g (x) g
+
+
 def test_double_of_sweedler():
     # Sweedler's H4 is neither commutative nor cocommutative and has S^2 != id,
     # so its double genuinely exercises the S^-1 in the double's multiplication

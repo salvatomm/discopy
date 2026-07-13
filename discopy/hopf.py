@@ -43,17 +43,68 @@ unlink.
 >>> hopf, split = complex(F(hopf_link(x))), complex(F(unlink(x)))
 >>> assert not np.isclose(hopf, split)          # a non-trivial invariant
 >>> assert np.isclose(hopf, 0) and np.isclose(split, 4)
+
+Axioms
+------
+The Hopf-algebra axioms are string diagrams over the signature ``ob``, ``unit``,
+``counit``, ``mult``, ``comult``, ``antipode`` (and ``rmatrix``). A
+:class:`HopfAlgebra` checks each axiom by evaluating both sides of the equation
+with its :meth:`~HopfAlgebra.functor` and comparing the resulting tensors.
+
+Associativity and the bialgebra law (``comult`` is an algebra homomorphism):
+
+>>> from discopy.drawing import Equation
+>>> associativity = Equation(mult @ ob >> mult, ob @ mult >> mult)
+>>> associativity.draw(path='docs/_static/hopf/associativity.png')
+
+.. image:: /_static/hopf/associativity.png
+    :align: center
+
+>>> bialgebra = Equation(
+...     mult >> comult,
+...     comult @ comult >> ob @ Swap(ob, ob) @ ob >> mult @ mult)
+>>> bialgebra.draw(path='docs/_static/hopf/bialgebra.png')
+
+.. image:: /_static/hopf/bialgebra.png
+    :align: center
+
+The antipode axiom, with the counit-then-unit on the right-hand side:
+
+>>> antipode_axiom = Equation(
+...     comult >> antipode @ ob >> mult, counit >> unit,
+...     comult >> ob @ antipode >> mult)
+>>> antipode_axiom.draw(path='docs/_static/hopf/antipode.png')
+
+.. image:: /_static/hopf/antipode.png
+    :align: center
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from discopy import ribbon, tensor
+from discopy import ribbon, symmetric, tensor
+from discopy.symmetric import Ty, Box, Swap, Id
 from discopy.tensor import Dim
 from discopy.utils import MappingOrCallable
 
 TOL = 1e-9
+
+# -- the signature of a (quasitriangular) Hopf algebra ----------------------
+# One object ``ob`` (the algebra) and one box per generator, so that the axioms
+# can be written and drawn as string diagrams and checked by evaluating both
+# sides with a :class:`.tensor.Functor` (see :meth:`HopfAlgebra.functor`).
+ob = Ty('H')
+unit = Box('$\\eta$', Ty(), ob)               #: the unit, ``1 -> H``
+counit = Box('$\\epsilon$', ob, Ty())         #: the counit, ``H -> 1``
+mult = Box('$\\nabla$', ob @ ob, ob)          #: the multiplication, ``H H -> H``
+comult = Box('$\\Delta$', ob, ob @ ob)        #: the comultiplication, ``H -> H H``
+antipode = Box('$S$', ob, ob)                 #: the antipode, ``H -> H``
+rmatrix = Box('$R$', Ty(), ob @ ob)           #: the R-matrix, ``1 -> H H``
+
+# the representation carries a second object ``rep`` with an action of ``ob``
+rep = Ty('V')
+action = Box('$\\rho$', ob @ rep, rep)        #: the action, ``H V -> V``
 
 
 class HopfAlgebra:
@@ -113,72 +164,92 @@ class HopfAlgebra:
         """ The counit :math:`\\epsilon(x)`. """
         return complex(self.counit @ x)
 
-    # -- axioms --------------------------------------------------------------
+    # -- diagrammatic semantics ----------------------------------------------
+    def functor(self):
+        """
+        The :class:`.tensor.Functor` sending each generator of the signature
+        (``ob``, ``unit``, ``counit``, ``mult``, ``comult``, ``antipode`` and,
+        if present, ``rmatrix``) to its structure tensor. Axioms are checked by
+        evaluating both sides of a diagram equation with this functor.
+        """
+        ar = {unit: self.unit, counit: self.counit, mult: self.mult,
+              comult: self.comult, antipode: self.antipode}
+        if self.R is not None:
+            ar[rmatrix] = self.R
+        return tensor.Functor(
+            ob={ob: self.dim}, ar=ar, dom=symmetric.Diagram, dtype=complex)
+
+    def check(self, *equations):
+        """
+        Whether every ``(lhs, rhs)`` diagram equation holds, i.e. the two sides
+        evaluate to the same tensor under :meth:`functor`.
+        """
+        F = self.functor()
+        return all(np.allclose(F(lhs).array, F(rhs).array, atol=TOL)
+                   for lhs, rhs in equations)
+
+    # -- axioms (as string diagrams) -----------------------------------------
     def is_associative(self):
-        left = np.einsum('ijm,mkl->ijkl', self.mult, self.mult, optimize=True)
-        right = np.einsum('jkm,iml->ijkl', self.mult, self.mult, optimize=True)
-        return np.allclose(left, right, atol=TOL)
+        """ ``(mult @ ob) >> mult == (ob @ mult) >> mult``. """
+        return self.check((mult @ ob >> mult, ob @ mult >> mult))
 
     def is_unital(self):
-        eye = np.eye(self.dim)
-        left = np.einsum('a,ajk->jk', self.unit, self.mult)
-        right = np.einsum('a,iak->ik', self.unit, self.mult)
-        return np.allclose(left, eye, atol=TOL) \
-            and np.allclose(right, eye, atol=TOL)
+        """ The unit is a left and right identity for ``mult``. """
+        return self.check(
+            (unit @ ob >> mult, Id(ob)), (ob @ unit >> mult, Id(ob)))
 
     def is_coassociative(self):
-        C = self.comult
-        left = np.einsum('ipq,prs->irsq', C, C, optimize=True)
-        right = np.einsum('ipq,qrs->iprs', C, C, optimize=True)
-        return np.allclose(left, right, atol=TOL)
+        """ ``comult >> (comult @ ob) == comult >> (ob @ comult)``. """
+        return self.check(
+            (comult >> comult @ ob, comult >> ob @ comult))
 
     def is_counital(self):
-        eye = np.eye(self.dim)
-        left = np.einsum('p,ipq->iq', self.counit, self.comult)
-        right = np.einsum('q,ipq->ip', self.counit, self.comult)
-        return np.allclose(left, eye, atol=TOL) \
-            and np.allclose(right, eye, atol=TOL)
+        """ The counit is a left and right identity for ``comult``. """
+        return self.check(
+            (comult >> counit @ ob, Id(ob)), (comult >> ob @ counit, Id(ob)))
+
+    def is_commutative(self):
+        """ ``Swap >> mult == mult`` (a *property*, not an axiom). """
+        return self.check((Swap(ob, ob) >> mult, mult))
+
+    def is_cocommutative(self):
+        """ ``comult >> Swap == comult`` (a *property*, not an axiom). """
+        return self.check((comult >> Swap(ob, ob), comult))
 
     def is_bialgebra(self):
-        # Delta is an algebra homomorphism (and unit/counit compatibility).
-        lhs = np.einsum('ijk,kpq->ijpq', self.mult, self.comult, optimize=True)
-        rhs = np.einsum('iab,jcd,ace,bdf->ijef', self.comult, self.comult,
-                        self.mult, self.mult, optimize=True)
-        unit_grouplike = np.allclose(
-            self.coprod(self.unit), np.outer(self.unit, self.unit), atol=TOL)
-        counit_hom = np.allclose(
-            np.einsum('ijk,k->ij', self.mult, self.counit),
-            np.outer(self.counit, self.counit), atol=TOL)
-        return np.allclose(lhs, rhs, atol=TOL) and unit_grouplike \
-            and counit_hom and abs(self.counit @ self.unit - 1) < TOL
+        """ ``comult`` and ``counit`` are algebra homomorphisms. """
+        return self.check(
+            (mult >> comult,
+             comult @ comult >> ob @ Swap(ob, ob) @ ob >> mult @ mult),
+            (mult >> counit, counit @ counit),
+            (unit >> comult, unit @ unit),
+            (unit >> counit, Id(Ty())))
 
     def has_antipode(self):
-        target = np.outer(self.counit, self.unit)
-        left = np.einsum('ipq,pr,rqk->ik',
-                         self.comult, self.antipode, self.mult, optimize=True)
-        right = np.einsum('ipq,qr,prk->ik',
-                          self.comult, self.antipode, self.mult, optimize=True)
-        return np.allclose(left, target, atol=TOL) \
-            and np.allclose(right, target, atol=TOL)
+        """ ``comult >> (S @ ob) >> mult == counit >> unit ==
+        comult >> (ob @ S) >> mult``. """
+        return self.check(
+            (comult >> antipode @ ob >> mult, counit >> unit),
+            (comult >> ob @ antipode >> mult, counit >> unit))
 
     def is_quasitriangular(self):
-        """ Whether ``R`` is a universal R-matrix (the three axioms). """
+        """
+        Whether ``R`` is a universal R-matrix: it intertwines ``comult`` with
+        its opposite and satisfies the two hexagon equations.
+        """
         if self.R is None:
             return False
-        R, C, M = self.R, self.comult, self.mult
-        # R Delta(a) = Delta^op(a) R
-        lhs = np.einsum('st,ipq,spk,tql->ikl', R, C, M, M, optimize=True)
-        rhs = np.einsum('ipq,st,qsk,ptl->ikl', C, R, M, M, optimize=True)
-        intertwiner = np.allclose(lhs, rhs, atol=TOL)
-        # (Delta (x) id) R = R13 R23
-        hexagon1 = np.allclose(
-            np.einsum('ij,ipq->pqj', R, C, optimize=True),
-            np.einsum('pc,qd,cdj->pqj', R, R, M, optimize=True), atol=TOL)
-        # (id (x) Delta) R = R13 R12
-        hexagon2 = np.allclose(
-            np.einsum('ij,jpq->ipq', R, C, optimize=True),
-            np.einsum('aq,bp,abi->ipq', R, R, M, optimize=True), atol=TOL)
-        return intertwiner and hexagon1 and hexagon2
+        swap = Swap(ob, ob)
+        return self.check(
+            # R Delta = Delta^op R
+            (rmatrix @ comult >> ob @ swap @ ob >> mult @ mult,
+             (comult >> swap) @ rmatrix >> ob @ swap @ ob >> mult @ mult),
+            # (Delta (x) id) R = R13 R23
+            (rmatrix >> comult @ ob,
+             rmatrix @ rmatrix >> ob @ swap @ ob >> ob @ ob @ mult),
+            # (id (x) Delta) R = R13 R12
+            (rmatrix >> ob @ comult,
+             rmatrix @ rmatrix >> ob @ swap @ ob >> mult @ ob @ ob >> ob @ swap))
 
     def validate(self):
         """ A dictionary of all the axiom checks. """
@@ -394,20 +465,43 @@ class Representation:
         return np.einsum('i,ijk->jk', np.asarray(element, dtype=complex),
                          self.action)
 
+    def functor(self):
+        """
+        The :class:`.tensor.Functor` extending :meth:`HopfAlgebra.functor` with
+        the object ``rep`` (the module :math:`V`) and the generator ``action``.
+        """
+        H = self.algebra
+        ar = {unit: H.unit, counit: H.counit, mult: H.mult, comult: H.comult,
+              antipode: H.antipode,
+              action: np.transpose(self.action, (0, 2, 1))}
+        if H.R is not None:
+            ar[rmatrix] = H.R
+        return tensor.Functor(
+            ob={ob: H.dim, rep: self.dim}, ar=ar,
+            dom=symmetric.Diagram, dtype=complex)
+
     def is_module(self):
-        """ Whether ``action`` is a representation: a homomorphism sending
-        :math:`1_H` to the identity. """
-        H, n = self.algebra, self.algebra.dim
-        if not np.allclose(self.act(H.unit), np.eye(self.dim), atol=TOL):
-            return False
-        basis = np.eye(n)
-        for i in range(n):
-            for j in range(n):
-                lhs = self.act(H.prod(basis[i], basis[j]))
-                rhs = self.act(basis[i]) @ self.act(basis[j])
-                if not np.allclose(lhs, rhs, atol=TOL):
-                    return False
-        return True
+        """
+        Whether ``action`` is a representation, i.e. the two module axioms hold
+        as string diagrams: ``action`` is associative over ``mult`` and unital
+        over ``unit``.
+
+        >>> D = HopfAlgebra.cyclic(2).double()
+        >>> V = Representation.double_sum(D, [(0, -1), (1, 1)])
+        >>> from discopy.drawing import Equation
+        >>> Equation(mult @ rep >> action, ob @ action >> action).draw(
+        ...     path='docs/_static/hopf/module.png')
+
+        .. image:: /_static/hopf/module.png
+            :align: center
+        """
+        F = self.functor()
+
+        def eq(lhs, rhs):
+            return np.allclose(F(lhs).array, F(rhs).array, atol=TOL)
+
+        return eq(mult @ rep >> action, ob @ action >> action) \
+            and eq(unit @ rep >> action, Id(rep))
 
     def dual_action(self):
         """ The action on the dual :math:`V^*`: :math:`\\rho^*(a) = \\rho(S(a))^T`. """
