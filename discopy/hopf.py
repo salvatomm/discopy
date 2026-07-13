@@ -127,8 +127,9 @@ class HopfAlgebra:
             and np.allclose(right, eye, atol=TOL)
 
     def is_coassociative(self):
-        left = np.einsum('ipq,prs->irsq', self.comult, self.comult, optimize=True)
-        right = np.einsum('ipq,qrs->iprs', self.comult, self.comult, optimize=True)
+        C = self.comult
+        left = np.einsum('ipq,prs->irsq', C, C, optimize=True)
+        right = np.einsum('ipq,qrs->iprs', C, C, optimize=True)
         return np.allclose(left, right, atol=TOL)
 
     def is_counital(self):
@@ -202,8 +203,7 @@ class HopfAlgebra:
             raise ValueError("Drinfeld element needs a quasitriangular structure.")
         # u = sum_ij R[i,j] S(e_j) e_i
         S_R2 = np.einsum('ij,jr->ijr', self.R, self.antipode)  # S(e_j)-> e_r
-        u = np.einsum('ijr,rik->k', S_R2, self.mult, optimize=True)
-        return u
+        return np.einsum('ijr,rik->k', S_R2, self.mult, optimize=True)
 
     def pivotal_element(self):
         """
@@ -262,6 +262,45 @@ class HopfAlgebra:
         """
         table = [[(i + j) % n for j in range(n)] for i in range(n)]
         return cls.group_algebra(table)
+
+    @classmethod
+    def sweedler(cls):
+        """
+        Sweedler's four-dimensional Hopf algebra, the smallest one that is
+        neither commutative nor cocommutative, with basis :math:`1, g, x, gx`
+        (:math:`g^2 = 1`, :math:`x^2 = 0`, :math:`xg = -gx`).
+
+        Its antipode has :math:`S^2 \\neq \\mathrm{id}`, so its
+        :meth:`double` genuinely exercises the :math:`S^{-1}` in the double's
+        multiplication -- unlike any (cocommutative) group algebra.
+
+        >>> H = HopfAlgebra.sweedler()
+        >>> assert H.is_valid() and H.dim == 4
+        >>> import numpy as np
+        >>> assert not np.allclose(H.antipode @ H.antipode, np.eye(4))
+        """
+        # basis 0: 1, 1: g, 2: x, 3: gx
+        unit = np.array([1, 0, 0, 0])
+        counit = np.array([1, 1, 0, 0])
+        mult = np.zeros((4, 4, 4))
+        for j in range(4):
+            mult[0, j, j] = 1                      # 1 . e_j = e_j
+        mult[1, 0, 1] = mult[1, 1, 0] = 1          # g.1=g, g.g=1
+        mult[1, 2, 3] = mult[1, 3, 2] = 1          # g.x=gx, g.gx=x
+        mult[2, 0, 2] = 1                          # x.1=x
+        mult[2, 1, 3] = -1                         # x.g = -gx
+        mult[3, 0, 3] = 1                          # gx.1=gx
+        mult[3, 1, 2] = -1                         # gx.g = -x
+        comult = np.zeros((4, 4, 4))
+        comult[0, 0, 0] = 1                        # D(1) = 1 (x) 1
+        comult[1, 1, 1] = 1                        # D(g) = g (x) g
+        comult[2, 2, 0] = comult[2, 1, 2] = 1      # D(x) = x(x)1 + g(x)x
+        comult[3, 3, 1] = comult[3, 0, 3] = 1      # D(gx) = gx(x)g + 1(x)gx
+        antipode = np.zeros((4, 4))
+        antipode[0, 0] = antipode[1, 1] = 1        # S(1)=1, S(g)=g
+        antipode[2, 3] = -1                        # S(x) = -gx
+        antipode[3, 2] = 1                         # S(gx) = x
+        return cls(unit, counit, mult, comult, antipode)
 
     def double(self):
         """

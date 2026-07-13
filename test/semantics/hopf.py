@@ -25,22 +25,16 @@ def test_double_is_quasitriangular_hopf_algebra():
         assert D.is_quasitriangular()
 
 
-def test_double_of_nonabelian_group():
-    # S3 as permutations: the double must work beyond the abelian case
-    from itertools import permutations
-    elts = list(permutations(range(3)))
-    idx = {e: i for i, e in enumerate(elts)}
-    table = [[idx[tuple(a[b[i]] for i in range(3))] for b in elts]
-             for a in elts]
-    kS3 = HopfAlgebra.group_algebra(table)
-    assert kS3.is_valid()
-    D = kS3.double()
-    assert D.dim == 36
-    # the double's noncommutative multiplication (with the S^-1 conjugation
-    # terms) is exercised by associativity and the antipode; the full
-    # bialgebra/quasitriangular checks are O(n^6)/O(n^7) and covered on the
-    # abelian doubles above.
-    assert D.is_associative() and D.is_coassociative() and D.has_antipode()
+def test_double_of_sweedler():
+    # Sweedler's H4 is neither commutative nor cocommutative and has S^2 != id,
+    # so its double genuinely exercises the S^-1 in the double's multiplication
+    # (a group algebra, being cocommutative with S^2 = id, would not).
+    H4 = HopfAlgebra.sweedler()
+    assert H4.is_valid() and H4.dim == 4
+    assert not np.allclose(H4.antipode @ H4.antipode, np.eye(4))  # S^2 != id
+    D = H4.double()
+    assert D.dim == 16
+    assert D.is_valid() and D.is_quasitriangular()
 
 
 def test_drinfeld_and_pivotal_element():
@@ -84,11 +78,10 @@ def test_braiding_yang_baxter_and_inverse():
         for b in range(d):
             swap[a * d + b, b * d + a] = 1
     assert not np.allclose(c, swap)
-    # Yang-Baxter on operators O = c^T (output x input)
-    O = c.T
-    I = np.eye(d)
-    O12, O23 = np.kron(O, I), np.kron(I, O)
-    assert np.allclose(O12 @ O23 @ O12, O23 @ O12 @ O23)
+    # Yang-Baxter on the braiding operator R = c^T (output x input)
+    R, eye = c.T, np.eye(d)
+    R12, R23 = np.kron(R, eye), np.kron(eye, R)
+    assert np.allclose(R12 @ R23 @ R12, R23 @ R12 @ R23)
 
 
 def test_quantum_dimension():
