@@ -512,13 +512,18 @@ class Representation:
         as string diagrams: ``action`` is associative over ``mult`` and unital
         over ``unit``.
 
-        >>> D = HopfAlgebra.cyclic(2).double()
-        >>> V = Representation.double_sum(D, [(0, -1), (1, 1)])
         >>> from discopy.drawing import Equation
-        >>> Equation(mult @ rep >> action, ob @ action >> action).draw(
-        ...     path='docs/_static/hopf/module.png')
+        >>> associativity = Equation(
+        ...     mult @ rep >> action, ob @ action >> action)
+        >>> associativity.draw(path='docs/_static/hopf/module_associativity.png')
 
-        .. image:: /_static/hopf/module.png
+        .. image:: /_static/hopf/module_associativity.png
+            :align: center
+
+        >>> unitality = Equation(unit @ rep >> action, Id(rep))
+        >>> unitality.draw(path='docs/_static/hopf/module_unitality.png')
+
+        .. image:: /_static/hopf/module_unitality.png
             :align: center
         """
         F = self.functor()
