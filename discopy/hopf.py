@@ -17,14 +17,14 @@ Summary
 
 A finite-dimensional quasitriangular Hopf algebra :math:`H` has a category of
 representations :math:`\\mathrm{Rep}(H)` which is braided: the braiding is the
-universal R-matrix, cups and caps come from the antipode and pivotal element, and
-(when :math:`H` is *ribbon*) the twist is the ribbon element. A quantum
-topological invariant of tangles is then a monoidal functor from the free
-:mod:`.ribbon` category into :math:`\\mathrm{Rep}(H)`, evaluated as concrete
-tensors (see :mod:`.tensor`).
+universal R-matrix, cups and caps come from the antipode and the pivotal
+element, and (when :math:`H` is *ribbon*) the twist is the ribbon element. A
+quantum topological invariant of tangles is then a monoidal functor from the
+free :mod:`.ribbon` category into :math:`\\mathrm{Rep}(H)`, evaluated as
+concrete tensors (see :mod:`.tensor`).
 
-This module lets you build any finite-dimensional Hopf algebra from its structure
-tensors and map any ribbon diagram to the corresponding linear map.
+This module lets you build any finite-dimensional Hopf algebra from its
+structure tensors and map any ribbon diagram to the corresponding linear map.
 
 Example
 -------
@@ -46,8 +46,8 @@ unlink.
 
 Axioms
 ------
-The Hopf-algebra axioms are string diagrams over the signature ``ob``, ``unit``,
-``counit``, ``mult``, ``comult``, ``antipode`` (and ``rmatrix``). A
+The Hopf-algebra axioms are string diagrams over the signature ``ob``,
+``unit``, ``counit``, ``mult``, ``comult``, ``antipode`` (and ``rmatrix``). A
 :class:`HopfAlgebra` checks each axiom by evaluating both sides of the equation
 with its :meth:`~HopfAlgebra.functor` and comparing the resulting tensors.
 
@@ -95,12 +95,12 @@ TOL = 1e-9
 # can be written and drawn as string diagrams and checked by evaluating both
 # sides with a :class:`.tensor.Functor` (see :meth:`HopfAlgebra.functor`).
 ob = Ty('H')
-unit = Box('$\\eta$', Ty(), ob)               #: the unit, ``1 -> H``
-counit = Box('$\\epsilon$', ob, Ty())         #: the counit, ``H -> 1``
-mult = Box('$\\nabla$', ob @ ob, ob)          #: the multiplication, ``H H -> H``
-comult = Box('$\\Delta$', ob, ob @ ob)        #: the comultiplication, ``H -> H H``
-antipode = Box('$S$', ob, ob)                 #: the antipode, ``H -> H``
-rmatrix = Box('$R$', Ty(), ob @ ob)           #: the R-matrix, ``1 -> H H``
+unit = Box('$\\eta$', Ty(), ob)          #: the unit, ``1 -> H``
+counit = Box('$\\epsilon$', ob, Ty())    #: the counit, ``H -> 1``
+mult = Box('$\\nabla$', ob @ ob, ob)     #: the multiplication, ``H H -> H``
+comult = Box('$\\Delta$', ob, ob @ ob)   #: the comultiplication, ``H -> H H``
+antipode = Box('$S$', ob, ob)            #: the antipode, ``H -> H``
+rmatrix = Box('$R$', Ty(), ob @ ob)      #: the R-matrix, ``1 -> H H``
 
 # the representation carries a second object ``rep`` with an action of ``ob``
 rep = Ty('V')
@@ -118,8 +118,9 @@ class HopfAlgebra:
         counit : The counit :math:`\\epsilon`, shape ``(n,)``.
         mult : The multiplication, ``mult[i, j, k]`` the coefficient of
             :math:`e_k` in :math:`e_i \\cdot e_j`, shape ``(n, n, n)``.
-        comult : The comultiplication, ``comult[i, p, q]`` the coefficient of
-            :math:`e_p \\otimes e_q` in :math:`\\Delta(e_i)``, shape ``(n, n, n)``.
+        comult : The comultiplication, ``comult[i, p, q]`` the coefficient
+            of :math:`e_p \\otimes e_q` in :math:`\\Delta(e_i)`, shape
+            ``(n, n, n)``.
         antipode : The antipode, ``antipode[i, j]`` the coefficient of
             :math:`e_j` in :math:`S(e_i)``, shape ``(n, n)``.
         R : The universal R-matrix, ``R[i, j]`` the coefficient of
@@ -257,7 +258,8 @@ class HopfAlgebra:
 
         >>> hexagon2 = Equation(
         ...     rmatrix >> ob @ comult,
-        ...     rmatrix @ rmatrix >> ob @ swap @ ob >> mult @ ob @ ob >> ob @ swap)
+        ...     rmatrix @ rmatrix >> ob @ swap @ ob
+        ...     >> mult @ ob @ ob >> ob @ swap)
         >>> hexagon2.draw(path='docs/_static/hopf/hexagon2.png')
 
         .. image:: /_static/hopf/hexagon2.png
@@ -275,7 +277,8 @@ class HopfAlgebra:
              rmatrix @ rmatrix >> ob @ swap @ ob >> ob @ ob @ mult),
             # (id (x) Delta) R = R13 R12
             (rmatrix >> ob @ comult,
-             rmatrix @ rmatrix >> ob @ swap @ ob >> mult @ ob @ ob >> ob @ swap))
+             rmatrix @ rmatrix >> ob @ swap @ ob
+             >> mult @ ob @ ob >> ob @ swap))
 
     def validate(self):
         """ A dictionary of all the axiom checks. """
@@ -297,7 +300,8 @@ class HopfAlgebra:
         The Drinfeld element :math:`u = \\sum S(R^{(2)}) R^{(1)}`.
         """
         if self.R is None:
-            raise ValueError("Drinfeld element needs a quasitriangular structure.")
+            raise ValueError(
+                "Drinfeld element needs a quasitriangular structure.")
         # u = sum_ij R[i,j] S(e_j) e_i
         S_R2 = np.einsum('ij,jr->ijr', self.R, self.antipode)  # S(e_j)-> e_r
         return np.einsum('ijr,rik->k', S_R2, self.mult, optimize=True)
@@ -401,11 +405,13 @@ class HopfAlgebra:
 
     def double(self):
         """
-        The Drinfeld quantum double :math:`D(H) = H^{*\\mathrm{cop}} \\otimes H`,
-        a quasitriangular Hopf algebra of dimension ``self.dim ** 2``.
+        The Drinfeld quantum double
+        :math:`D(H) = H^{*\\mathrm{cop}} \\otimes H`, a quasitriangular Hopf
+        algebra of dimension ``self.dim ** 2``.
 
-        This is the general construction on *any* finite-dimensional Hopf algebra
-        with invertible antipode (the group algebra is only one example). The
+        This is the general construction on *any* finite-dimensional Hopf
+        algebra with invertible antipode (the group algebra is only one
+        example). The
         basis is :math:`f^b \\otimes e_a` at flat index ``b * dim + a``, with
         :math:`\\{f^b\\}` the dual basis of :math:`H^*`.
 
@@ -417,8 +423,8 @@ class HopfAlgebra:
             self.antipode
         Sinv = np.linalg.inv(Sa)
         # H* structure constants from the pairing <f^i, e_j> = delta_ij
-        Mstar = np.transpose(C, (1, 2, 0))     # f^i f^j = sum_l C[l,i,j] f^l
-        Cstar = np.transpose(M, (2, 0, 1))     # Delta*(f^k) = sum M[i,j,k] f^i(x)f^j
+        Mstar = np.transpose(C, (1, 2, 0))   # f^i f^j = sum_l C[l,i,j] f^l
+        Cstar = np.transpose(M, (2, 0, 1))  # Delta* f^k = sum M[i,j,k] f^i f^j
         C2 = np.einsum('ipq,prs->irsq', C, C, optimize=True)
         Cstar2 = np.einsum('bmz,mxy->bxyz', Cstar, Cstar, optimize=True)
         N = n * n
@@ -469,12 +475,12 @@ class Representation:
     Parameters:
         algebra : The :class:`HopfAlgebra` :math:`H`.
         dim : The dimension :math:`d` of the underlying space :math:`V`.
-        action : The action tensor, ``action[i]`` the :math:`d \\times d` matrix
-            of :math:`\\rho(e_i)`, shape ``(n, d, d)``.
+        action : The action tensor, ``action[i]`` the :math:`d \\times d`
+            matrix of :math:`\\rho(e_i)`, shape ``(n, d, d)``.
 
     The structural morphisms of :math:`\\mathrm{Rep}(H)` are the braiding
-    :math:`c = \\tau \\circ (\\rho \\otimes \\rho)(R)`, the (co)evaluations built
-    from the antipode and the pivotal element :math:`g`, and the twist
+    :math:`c = \\tau \\circ (\\rho \\otimes \\rho)(R)`, the (co)evaluations
+    built from the antipode and the pivotal element :math:`g`, and the twist
     :math:`\\theta = \\rho(v)`.
     """
     def __init__(self, algebra, dim, action):
@@ -515,7 +521,8 @@ class Representation:
         >>> from discopy.drawing import Equation
         >>> associativity = Equation(
         ...     mult @ rep >> action, ob @ action >> action)
-        >>> associativity.draw(path='docs/_static/hopf/module_associativity.png')
+        >>> associativity.draw(
+        ...     path='docs/_static/hopf/module_associativity.png')
 
         .. image:: /_static/hopf/module_associativity.png
             :align: center
@@ -535,7 +542,10 @@ class Representation:
             and eq(unit @ rep >> action, Id(rep))
 
     def dual_action(self):
-        """ The action on the dual :math:`V^*`: :math:`\\rho^*(a) = \\rho(S(a))^T`. """
+        """
+        The action on the dual :math:`V^*`:
+        :math:`\\rho^*(a) = \\rho(S(a))^T`.
+        """
         S = self.algebra.antipode
         return np.einsum('ij,jkl->ilk', S, self.action)  # rho(S(e_i))^T
 
@@ -565,8 +575,9 @@ class Representation:
         for i in range(H.dim):
             for j in range(H.dim):
                 if H.R[i, j] != 0:
+                    basis = np.eye(H.dim)
                     R_action += H.R[i, j] * np.kron(
-                        self.act(np.eye(H.dim)[i]), other.act(np.eye(H.dim)[j]))
+                        self.act(basis[i]), other.act(basis[j]))
         # tau: V (x) W -> W (x) V,  input (a, b) -> output (b, a)
         swap = np.zeros((dW * dV, dV * dW), dtype=complex)
         for a in range(dV):
@@ -592,9 +603,9 @@ class Representation:
     @classmethod
     def double_sum(cls, double, anyons):
         """
-        The direct sum of anyon modules of the quantum double of a cyclic group
-        algebra. Each anyon is a pair ``(flux, charge)`` where ``flux`` is a group
-        index and the group element ``e_a`` acts by ``charge ** a``.
+        The direct sum of anyon modules of the quantum double of a cyclic
+        group algebra. Each anyon is a pair ``(flux, charge)`` where ``flux``
+        is a group index and the group element ``e_a`` acts by ``charge ** a``.
 
         >>> D = HopfAlgebra.cyclic(2).double()
         >>> V = Representation.double_sum(D, [(0, -1), (1, 1)])  # e (+) m
@@ -618,14 +629,16 @@ def _is_adjoint(ob):
 
 class Functor(ribbon.Functor):
     """
-    A ribbon functor from :mod:`.ribbon` diagrams into :math:`\\mathrm{Rep}(H)`,
-    evaluated as concrete :class:`.tensor.Tensor`.
+    A ribbon functor from :mod:`.ribbon` diagrams into
+    :math:`\\mathrm{Rep}(H)`, evaluated as concrete :class:`.tensor.Tensor`.
 
     Parameters:
-        ob : A mapping from atomic :class:`.ribbon.Ty` to :class:`Representation`.
+        ob : A mapping from atomic :class:`.ribbon.Ty` to
+            :class:`Representation`.
         ar : A mapping from generating :class:`.ribbon.Box` to arrays.
-        contractor : The tensor-network contractor, see :class:`.tensor.Functor`
-            (``None`` for the naive functor, or ``'einsum'``, ``'tn'``, ...).
+        contractor : The tensor-network contractor, see
+            :class:`.tensor.Functor` (``None`` for the naive functor, or
+            ``'einsum'``, ``'tn'``, ...).
         backend : The array backend to evaluate in.
 
     The braiding is sent to the R-matrix, cups and caps to the (co)evaluations,
@@ -685,7 +698,8 @@ class Functor(ribbon.Functor):
             array = np.linalg.inv(G).T if not _is_adjoint(left) else np.eye(d)
             return Box(str(box), Dim(d) @ Dim(d), Dim(), array.reshape(-1))
         # generic box
-        return Box(box.name, self.dim(box.dom), self.dim(box.cod), self.ar[box])
+        return Box(
+            box.name, self.dim(box.dom), self.dim(box.cod), self.ar[box])
 
     def _to_tensor_diagram(self, diagram):
         result = tensor.Diagram.id(self.dim(diagram.dom))
