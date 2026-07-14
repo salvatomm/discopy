@@ -271,7 +271,7 @@ class Hypergraph(MonoidalCategory, NamedGeneric['functor']):
         return result
 
     @cached_property
-    def ports(self):
+    def ports(self) -> list[Node]:
         """
         The ports in a diagram.
 
