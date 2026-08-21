@@ -132,6 +132,11 @@ POOL = "mean"
 #: and the artifacts it filed -- still mean what they meant.
 SETTLE = (None, "interior", "terminal")
 
+#: What best-validation checkpoint selection maximises; see
+#: :attr:`Budget.selection`.  ``None`` is the reference's own rule and
+#: every number this study measured before 2026-08-19.
+SELECTION = (None, "deep")
+
 
 def holding(settle) -> str:
     """
@@ -209,7 +214,18 @@ class Budget:
         n_train : The trajectories used, ``None`` for the whole split.
         n_wide : The trajectories of the larger out-of-distribution split
                  that are scored; the canonical 32 are always scored whole.
-        eval_every : The epochs between two validation passes.
+        eval_every : The epochs between two validation passes, and so
+                     how densely best-val checkpoint selection samples the
+                     run.  It is an axis rather than a housekeeping
+                     number: `floor-replication.md` measured ~+3 points on
+                     `dijkstra` inside the reference from its own denser
+                     cadence alone, and it is therefore part of
+                     :attr:`tag` -- two cadences file separately, because
+                     a checkpoint chosen out of 30 candidates and one
+                     chosen out of 300 are not the same model.  Note the
+                     unit: 10 *epochs* here is one validation per 320
+                     optimizer steps, where the reference validates every
+                     10 steps.
         seeds : The seeds to train.
         sweep : The test-time depths, as multiples of the trained one.
                 A *multiple* rather than a round count, because under the
@@ -257,6 +273,21 @@ class Budget:
                  alone: see ``backward``, and ``PART3.md`` for why a
                  residual stopping rule cannot be trained against
                  without changing two things at once.
+        selection : What best-validation checkpoint selection maximises,
+                    a member of :data:`SELECTION`.  ``None`` is the plain
+                    validation score at the trained depth, the reference's
+                    rule and every number before it.  ``"deep"`` maximises
+                    ``min(val, val at 3x depth)`` -- still **only** the
+                    ``n = 16`` validation split, no out-of-distribution
+                    sample is read -- i.e. "reaches the answer *and stays
+                    there*", the property :meth:`model.Model.loss` says the
+                    output supervision exists to train.  It is an axis
+                    because the plain rule is measurably blind here: over
+                    six runs of the ``probe`` arm the validation score at
+                    the trained depth spans 0.9941-1.0000 while their
+                    out-of-distribution scores span 0.30-0.98, and the
+                    depth-held score correlates with the latter at
+                    ``r = +0.92``.
         probe : Whether the hint loss is decoded from a **detached**
                 state, so that it fits the hint decoders and never the
                 interaction.  This is what an *output-only* arm of
@@ -278,6 +309,30 @@ class Budget:
                    runs with -- ``"full"`` is *bitwise* ``Iterate``, so
                    ``"last"`` is the only fixed-point arm that is a row
                    rather than a rename.
+        feedback : Whether hints are re-encoded into the state at every
+                   checkpoint boundary, the floor's own closed loop and
+                   T-D's arm (``artifacts/td-design.md``).  ``None`` is
+                   open-loop, every campaign before Phase 3's T-D;
+                   ``"state"`` feeds the node-located scalar and mask
+                   hints onto the node input loop.  The fed value is
+                   ground truth with probability :attr:`forcing` at
+                   train time and the model's own hard-decoded hint
+                   otherwise and always at evaluation; ``hints[0]`` is
+                   fed at the start in both regimes, as the reference
+                   does.
+        forcing : The teacher-forcing coin of the closed loop, the 2022
+                  recipe's 0.5 by default; read only under
+                  ``feedback``.
+        dense : Whether the diagram is the complete graph on the nodes
+                whatever the algorithm, the reference MPNN's wiring and
+                T-C's arm (``artifacts/tc-design.md``): the sampled
+                graph enters as the ``adj`` edge feature instead of the
+                wiring, via :func:`dataset.densify`.
+        trm : Whether the run is the TRM arm
+              (``artifacts/trm-design.md``): segment-stepped rollout
+              with the state detached at every checkpoint boundary
+              (deep supervision), plus a detached soft-minimum halt
+              head trained on per-node output correctness.
     """
     name: str
     epochs: int
@@ -297,11 +352,16 @@ class Budget:
     hint_weight: float = HINT_WEIGHT
     mixed: bool = False
     settle: str = None
+    selection: str = None
     pointer: str = "bilinear"
     pos: str = "sampler"
     solver: str = "iterate"
     backward: str = "full"
     probe: bool = False
+    feedback: str = None
+    forcing: float = 0.5
+    dense: bool = False
+    trm: bool = False
 
     @property
     def tag(self) -> str:
@@ -327,6 +387,8 @@ class Budget:
         'full-settle-term'
         >>> replace(FULL, solver="fixedpoint", backward="last").tag
         'full-fixedpoint-last'
+        >>> replace(FULL, eval_every=1).tag
+        'full-ev1'
         """
         parts = [self.name]
         if self.widths != "mpnn":
@@ -348,8 +410,19 @@ class Budget:
             parts.append("settle")
             if holding(self.settle) == "terminal":
                 parts.append("term")
+        if self.selection:
+            parts.append(f"sel{self.selection}")
         if self.probe:
             parts.append("probe")
+        if self.feedback:
+            parts.append("closed" if self.feedback == "state"
+                         else f"closed-{self.feedback}")
+            if self.forcing != 0.5:
+                parts.append("f" + str(self.forcing).replace(".", "_"))
+        if self.dense:
+            parts.append("dense")
+        if self.trm:
+            parts.append("trm")
         if self.solver != "iterate":
             parts.append(self.solver)
             if self.backward != "full":
@@ -358,6 +431,8 @@ class Budget:
             parts.append(f"n{self.n_train}")
         if self.rounds is not None:
             parts.append(f"r{self.rounds}")
+        if self.eval_every != 10:
+            parts.append(f"ev{self.eval_every}")
         return "-".join(parts)
 
 

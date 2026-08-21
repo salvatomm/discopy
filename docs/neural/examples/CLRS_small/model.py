@@ -67,6 +67,7 @@ import numpy as np
 import torch
 
 from discopy.frobenius import Ty
+from discopy.neural.solver import HaltHead
 from discopy.neural import (
     Dim, FixedPoint, Iterate, MapNN, Mode, Orbit, Signature, Site, Sym, cells,
     from_incidence)
@@ -1349,6 +1350,29 @@ DECODERS = {
 }
 
 
+def refed(algorithm: str, feedback: str = "state") -> tuple:
+    """
+    The hint probes a closed loop re-encodes into the state: T-D's arm,
+    ``artifacts/td-design.md``.
+
+    ``"state"`` is the node-located scalar and mask hints -- the ones
+    whose value lives on a node and needs no edge-side encoding, and
+    the ones the mechanism metric (`bellman_ford`'s ``d``) lives in.
+
+    Example
+    -------
+    >>> refed("bellman_ford"), refed("bfs")
+    (('d', 'msk'), ('reach_h',))
+    """
+    if feedback != "state":
+        raise ValueError(f"feedback {feedback!r} is not implemented; "
+                         f"'full' is T-D's second arm and runs only if "
+                         f"'state' moves")
+    return tuple(name for name in probes(algorithm, "hint")
+                 if kind(algorithm, name) in
+                 (("node", "scalar"), ("node", "mask")))
+
+
 def decoded(algorithm: str) -> tuple:
     """
     The probes one algorithm decodes -- every hint and every output -- in
@@ -1441,7 +1465,10 @@ class Model(torch.nn.Module):
                  encoders: torch.nn.ModuleDict,
                  decoders: torch.nn.ModuleDict, hops: int = HOPS,
                  steps: int = None, hint_weight: float = HINT_WEIGHT,
-                 settle: str = None, probe: bool = False):
+                 settle: str = None, probe: bool = False,
+                 feedback: str = None, forcing: float = 0.5,
+                 feedback_encoders: torch.nn.ModuleDict = None,
+                 halt: HaltHead = None):
         super().__init__()
         self.algorithm = algorithm
         self.map = interpretation
@@ -1451,6 +1478,11 @@ class Model(torch.nn.Module):
         self.hint_weight = hint_weight
         self.settle = holding(settle)
         self.probe = probe
+        self.feedback, self.forcing = feedback, forcing
+        self.feedback_encoders = feedback_encoders
+        self.halt = halt
+        #: Eval-time latent noise at checkpoint boundaries, off by default.
+        self.noise = 0.0
         self.answer = ("node", STATE)
 
     # --- what the model needs to know about the map ------------------------
@@ -1477,6 +1509,16 @@ class Model(torch.nn.Module):
 
     # --- the two ends of the task ------------------------------------------
 
+    def node_input(self, batch: Batch):
+        """ The summed embeddings of the node inputs, ``(nodes, dim)``. """
+        found = None
+        for name, location in encoded(self.algorithm):
+            if location != "node":
+                continue
+            term = self.encoders[name](batch.inputs[name].reshape(-1, 1))
+            found = term if found is None else found + term
+        return found
+
     def encode(self, batch: Batch, values: dict) -> dict:
         """
         The initial values of every written family: the summed embeddings
@@ -1487,22 +1529,75 @@ class Model(torch.nn.Module):
             batch : The batch to run.
             values : The tensors to write, added to in place.
         """
-        node_input, edge_input = None, None
+        node_input, edge_input = self.node_input(batch), None
         for name, location in encoded(self.algorithm):
-            encoder = self.encoders[name]
-            if location == "node":
-                found = encoder(batch.inputs[name].reshape(-1, 1))
-                node_input = found if node_input is None \
-                    else node_input + found
-            elif batch.n_edges:
-                found = encoder(batch.edge_inputs[name].reshape(-1, 1))
-                edge_input = found if edge_input is None \
-                    else edge_input + found
+            if location == "node" or not batch.n_edges:
+                continue
+            found = self.encoders[name](
+                batch.edge_inputs[name].reshape(-1, 1))
+            edge_input = found if edge_input is None \
+                else edge_input + found
         if node_input is not None:
             values["node", FEAT] = node_input.unsqueeze(0)
         if edge_input is not None:
             values["edge", WEIGHT] = edge_input.unsqueeze(0)
         return values
+
+    def refeed(self, batch: Batch, state, step: int):
+        """
+        The closed loop: rewrite the node input loop as the encoded
+        inputs *plus* the encoded hints of this step -- the floor's own
+        state re-grounding, imported as T-D's arm
+        (``artifacts/td-design.md``).
+
+        Entering the segment that produces checkpoint ``step``, the fed
+        hint is ``hints[step]``: ground truth per sample with
+        probability :attr:`forcing` at train time, the model's own
+        **hard**-decoded estimate otherwise and always at evaluation.
+        ``hints[0]`` -- the initial condition, derivable from the
+        inputs -- is fed at the start in both regimes, exactly as
+        ``clrs._src.nets`` does.  Fed values are detached (the
+        reference's non-differentiable hard path); the feedback
+        encoders train through the rounds that read the loop.
+
+        Parameters:
+            batch : The batch being run.
+            state : The flat state at the previous checkpoint.
+            step : The zero-based checkpoint about to be produced.
+        """
+        names = refed(self.algorithm, self.feedback)
+        if not names:
+            return state
+        if step == 0:
+            values = {name: batch.hints[name][0] for name in names}
+        else:
+            with torch.no_grad():
+                guesses = self.decode(batch, state, names=list(names))
+            rows = torch.arange(len(batch),
+                                device=batch.lengths.device)
+            clamped = torch.minimum(
+                torch.full_like(batch.lengths, step), batch.lengths - 1)
+            force = torch.rand(
+                len(batch), device=batch.lengths.device) < self.forcing \
+                if self.training and self.forcing > 0 else None
+            values = {}
+            for name in names:
+                guess = guesses[name].detach()
+                if kind(self.algorithm, name) == ("node", "mask"):
+                    guess = (guess > 0).to(guess.dtype)
+                if force is not None and bool(force.any()):
+                    truth = batch.hints[name][clamped, rows].to(guess.dtype)
+                    guess = torch.where(force.unsqueeze(-1), truth, guess)
+                values[name] = guess
+        hint_input = None
+        for name in names:
+            term = self.feedback_encoders[name](
+                values[name].reshape(-1, 1))
+            hint_input = term if hint_input is None else hint_input + term
+        interaction = self.map.compile(batch.diagram)
+        return interaction.write(
+            state, ("node", FEAT),
+            (self.node_input(batch) + hint_input).unsqueeze(0))
 
     def states(self, batch: Batch, state):
         """ The node states of a batch, of shape ``(samples, nodes, w)``. """
@@ -1580,6 +1675,26 @@ class Model(torch.nn.Module):
         """
         overrides.setdefault("rounds", self.rounds_for(batch, factor))
         state = self.initial(batch) if state is None else state
+        if self.feedback or self.halt is not None:
+            # The closed loop and the TRM arm both run segment by
+            # segment -- the resumption law makes the pieces exact.  The
+            # closed loop refeeds the state at every checkpoint boundary;
+            # the TRM arm detaches there instead, so a checkpoint's
+            # gradient reaches its own segment alone (deep supervision),
+            # and adds the eval-time latent noise of the selection
+            # protocol when :attr:`noise` is set.
+            found = []
+            for step, _, _ in alignment(overrides["rounds"], self.hops):
+                if self.feedback:
+                    state = self.refeed(batch, state, step)
+                state = self.map(batch.diagram, state, rounds=self.hops)
+                found.append(state)
+                if self.halt is not None:
+                    state = state.detach()
+                    if self.noise:
+                        state = state + self.noise * torch.randn_like(state)
+            found = found or [state]
+            return found if deep else [found[-1]]
         if not deep:
             return [self.map(batch.diagram, state, **overrides)]
         return self.checkpoints(
@@ -1606,6 +1721,44 @@ class Model(torch.nn.Module):
         every = self.run(batch, state, deep=deep, **overrides)
         found = [self.decode(batch, one, names) for one in every]
         return found if deep else found[-1]
+
+    # --- the halt head -----------------------------------------------------
+
+    def correctness(self, batch: Batch, prediction: dict):
+        """
+        Per-node correctness of the decoded outputs, ``(samples, nodes)``
+        booleans: the halt head's target.  Pointer and mask heads have a
+        per-node notion of right; probes without one are left out, and a
+        batch with none returns ``None``.
+
+        Parameters:
+            batch : The batch the prediction belongs to.
+            prediction : Per output probe, the decoded prediction.
+        """
+        found = None
+        for name, pred in prediction.items():
+            what = kind(self.algorithm, name)
+            truth = batch.outputs[name]
+            if what == ("node", "pointer"):
+                good = pred.argmax(-1) == truth.long()
+            elif what in (("node", "mask"), ("node", "mask_one")):
+                good = (pred > 0) == (truth > 0.5)
+            else:
+                continue
+            found = good if found is None else found & good
+        return found
+
+    def halt_logit(self, batch: Batch, state):
+        """
+        The problem-level halt logit of one checkpoint, ``(samples, )``:
+        what the selection protocol ranks rollouts by.
+
+        Parameters:
+            batch : The batch the state belongs to.
+            state : The flat messages of the checkpoint.
+        """
+        return self.halt.logit(
+            self.halt.read(self.states(batch, state).detach()))
 
     # --- the loss ----------------------------------------------------------
 
@@ -1750,7 +1903,7 @@ class Model(torch.nn.Module):
         """
         every = self.run(batch, state, deep=True, **overrides)
         settled = (batch.lengths - 1).clamp(max=len(every) - 1)
-        output, hint, each = 0.0, 0.0, {}
+        output, hint, halt, each = 0.0, 0.0, 0.0, {}
         for step, found in enumerate(every):
             done = settled <= step
             if bool(done.any()):
@@ -1761,6 +1914,16 @@ class Model(torch.nn.Module):
                         prediction[name][done], batch.outputs[name][done])
                     output, each[name] = output + term, each.get(
                         name, 0.0) + term
+            if self.halt is not None:
+                with torch.no_grad():
+                    names = probes(self.algorithm, "output")
+                    guessed = self.decode(batch, found, names=names)
+                    right = self.correctness(batch, guessed)
+                if right is not None:
+                    read = self.halt.read(self.states(batch, found).detach())
+                    term = self.halt.loss(read, right)
+                    halt, each["halt"] = halt + term, each.get(
+                        "halt", 0.0) + term
             targets = self.hint_targets(batch, step)
             if targets:
                 prediction = self.decode(
@@ -1771,8 +1934,8 @@ class Model(torch.nn.Module):
                         prediction[name][alive], truth)
                     hint, each[name] = hint + term, each.get(name, 0.0) + term
         steps = max(len(every), 1)
-        output, hint = output / steps, hint / steps
-        return output + self.hint_weight * hint, {
+        output, hint, halt = output / steps, hint / steps, halt / steps
+        return output + self.hint_weight * hint + halt, {
             "output": _number(output), "hint": _number(hint),
             **{f"probe/{name}": _number(term / steps)
                for name, term in each.items()}}
@@ -1871,7 +2034,8 @@ def build(algorithm: str, widths: Widths = None, steps: int = None,
           cache: int = 256, hint_weight: float = HINT_WEIGHT,
           settle: str = None, pointer: str = "bilinear",
           solver: str = "iterate", backward: str = "full",
-          probe: bool = False) -> Model:
+          probe: bool = False, feedback: str = None,
+          forcing: float = 0.5, trm: bool = False) -> Model:
     """
     The message-passing model: a diagram per batch, one shared cell per
     generator name, one encoder per input and one decoder per probe.
@@ -1910,6 +2074,10 @@ def build(algorithm: str, widths: Widths = None, steps: int = None,
                    solver alone.
         probe : Whether the hint loss reaches the decoders alone; see
                 :meth:`Model.loss`.
+        trm : Whether to build the TRM arm (``artifacts/trm-design.md``):
+              a detached soft-minimum :class:`~discopy.neural.solver.
+              HaltHead` over the node states, and with it the
+              segment-detached rollout of :meth:`Model.run`.
 
     Example
     -------
@@ -1950,11 +2118,16 @@ def build(algorithm: str, widths: Widths = None, steps: int = None,
         ar["edge"] = link
     carried = (("node", FEAT), ) + (
         (("edge", WEIGHT), ) if link is not None else ())
+    feedback_encoders = torch.nn.ModuleDict({
+        name: Encoder(widths.dim) for name in refed(algorithm, feedback)}) \
+        if feedback else None
     return Model(
         algorithm,
         MapNN(ob, ar, solver=SOLVERS[solver](backward, carried), cache=cache),
         encoders, decoders, steps=steps, hint_weight=hint_weight,
-        settle=settle, probe=probe)
+        settle=settle, probe=probe, feedback=feedback, forcing=forcing,
+        feedback_encoders=feedback_encoders,
+        halt=HaltHead(widths.state_dim, "softmin") if trm else None)
 
 
 def fit_cache(model, *batches) -> int:

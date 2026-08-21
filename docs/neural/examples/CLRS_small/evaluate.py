@@ -357,6 +357,93 @@ def quantiles(steps: list) -> dict:
             "high": float(np.quantile(rounds, 0.9))}
 
 
+# --- halt-selection (the TRM eval protocol) ---------------------------------
+
+@torch.no_grad()
+def selection(model, batches, k: int, sigma: float,
+              factor: float = 1.0) -> dict:
+    """
+    The TRM selection protocol (``artifacts/trm-design.md``): ``k``
+    rollouts per batch -- the first noiseless, the rest with latent
+    Gaussian noise ``sigma`` at every checkpoint boundary -- with the
+    final halt logit choosing per sample, scored once over the split.
+
+    Parameters:
+        model : A TRM model (:attr:`Model.halt` is set).
+        batches : The batches of one split.
+        k : The rollouts per batch; ``1`` is the plain greedy rollout.
+        sigma : The noise scale of rollouts ``2 .. k``.
+        factor : The multiple of the trained depth to run at.
+    """
+    names = probes(model.algorithm, "output")
+    pooled = {name: ([], []) for name in names}
+    for batch in batches:
+        best_logit, best = None, None
+        for rollout in range(k):
+            model.noise = 0.0 if rollout == 0 else sigma
+            state = model.run(batch, deep=False, factor=factor)[-1]
+            model.noise = 0.0
+            logit = model.halt_logit(batch, state)
+            prediction = model.decode(batch, state, names=names)
+            if best is None:
+                best_logit, best = logit, prediction
+                continue
+            better = logit > best_logit
+            best_logit = torch.where(better, logit, best_logit)
+            best = {name: torch.where(
+                better.view(-1, *([1] * (prediction[name].dim() - 1))),
+                prediction[name], best[name]) for name in names}
+        for name in names:
+            pooled[name][0].append(best[name].cpu().numpy())
+            pooled[name][1].append(batch.outputs[name].cpu().numpy())
+    return zoo.score(model.algorithm, {
+        name: (np.concatenate(p), np.concatenate(t))
+        for name, (p, t) in pooled.items()})
+
+
+def selection_report(algorithm: str, budget: Budget, seeds, ks, sigma: float,
+                     device=None, log=print) -> dict:
+    """
+    The selection protocol over the three splits, per seed and per ``k``,
+    written to ``<tag>-<algorithm>-select.json``.
+
+    Parameters:
+        algorithm : The algorithm.
+        budget : The budget the model was trained under.
+        seeds : The seeds to score.
+        ks : The rollout counts to sweep.
+        sigma : The noise scale.
+        device : Where to run, the GPU by default.
+        log : Where to print progress.
+    """
+    device = training.default_device() if device is None else device
+    splits = dataset.load_all(algorithm)
+    splits["wide"] = splits["wide"].subsample(budget.n_wide)
+    batches = {name: zoo.Batches(splits[name], budget.eval_batch_size, device)
+               for name in ("val", "test", "wide")}
+    rows = []
+    for seed in (seeds or budget.seeds):
+        model, _ = training.train_model(
+            algorithm, budget, seed, device=device, splits=splits)
+        zoo.fit_cache(model, *batches.values())
+        row = {"seed": seed, "sigma": sigma, "by_k": {}}
+        for k in ks:
+            row["by_k"][k] = {
+                name: selection(model, batches[name], k, sigma)["score"]
+                for name in ("val", "test", "wide")}
+            log(f"  {algorithm}/seed{seed} k={k} sigma={sigma}:"
+                + "".join(f"  {name} {row['by_k'][k][name]:.4f}"
+                          for name in ("val", "test", "wide")))
+        rows.append(row)
+    found = {"algorithm": algorithm, "budget": budget.tag,
+             "protocol": "first rollout noiseless; halt logit selects",
+             "seeds": rows}
+    path = ARTIFACTS / f"{budget.tag}-{algorithm}-select.json"
+    path.write_text(json.dumps(found, indent=2))
+    log(f"  {algorithm}: -> {path.name}")
+    return found
+
+
 # --- the report ------------------------------------------------------------
 
 def report(algorithm: str, budget: Budget = FULL, seeds=None, device=None,
@@ -1251,6 +1338,12 @@ def main(argv=None) -> int:
     parser.add_argument("--rounds", type=int, default=None)
     parser.add_argument("--pool", choices=sorted(POOL), default=None)
     parser.add_argument("--widths", choices=sorted(WIDTHS), default=None)
+    parser.add_argument("--eval-every", dest="eval_every", type=int,
+                        default=None,
+                        help="epochs between validation passes, i.e. how "
+                             "densely best-val selection samples the run; "
+                             "it is part of the tag, so two cadences file "
+                             "separately")
     parser.add_argument("--hint-weight", dest="hint_weight", type=float,
                         default=None)
     parser.add_argument("--node-only", action="store_true")
@@ -1279,6 +1372,21 @@ def main(argv=None) -> int:
     parser.add_argument("--settle", nargs="?", const="interior",
                         choices=[one for one in SETTLE if one], default=None,
                         help="hold a finished trajectory's last hint")
+    parser.add_argument("--feedback", choices=("state", ), default=None,
+                        help="the closed loop, T-D's arm; see train.py")
+    parser.add_argument("--forcing", type=float, default=None)
+    parser.add_argument("--dense", action="store_true",
+                        help="the complete-graph diagram, T-C's arm; "
+                             "see train.py")
+    parser.add_argument("--trm", action="store_true",
+                        help="the TRM arm: artifacts/trm-design.md")
+    parser.add_argument("--select", type=int, nargs="*", default=None,
+                        help="halt-selection rollout counts, e.g. 1 4 16")
+    parser.add_argument("--sigma", type=float, default=0.1,
+                        help="latent noise scale of the selection rollouts")
+    parser.add_argument("--selection", default=None,
+                        help="what best-val selection maximised at training "
+                             "time; part of the tag")
     parser.add_argument("--probe", action="store_true",
                         help="fit the hint heads on a detached state")
     parser.add_argument("--solver", choices=sorted(SOLVERS), default=None,
@@ -1295,15 +1403,24 @@ def main(argv=None) -> int:
         else QUICK if arguments.quick else FULL
     for key in ("epochs", "rounds", "pool", "widths",
                 "hint_weight", "pointer", "pos", "settle",
-                "solver", "backward", "n_train"):
+                "solver", "backward", "n_train", "feedback", "forcing",
+                "eval_every", "selection"):
         if getattr(arguments, key) is not None:
             budget = replace(budget, **{key: getattr(arguments, key)})
-    for key in ("mixed", "probe"):
+    for key in ("mixed", "probe", "dense", "trm"):
         if getattr(arguments, key):
             budget = replace(budget, **{key: True})
     if arguments.node_only:
         budget = replace(budget, edge_state=False, widths="paired")
+    if budget.dense:
+        for algorithm in arguments.algorithms:
+            dataset.densify(algorithm)
     device = torch.device(arguments.device) if arguments.device else None
+    if arguments.select:
+        for algorithm in arguments.algorithms:
+            selection_report(algorithm, budget, arguments.seeds,
+                             arguments.select, arguments.sigma, device)
+        return 0
     if arguments.h1:
         for algorithm in arguments.algorithms:
             h1_table(algorithm, budget)

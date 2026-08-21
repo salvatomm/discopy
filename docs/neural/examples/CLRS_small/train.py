@@ -45,7 +45,7 @@ import dataset
 import model as zoo
 from config import (
     ALGORITHMS, ARTIFACTS, FULL, GRAD_CLIP, H2_ARMS, MIXED, QUICK, REGIME,
-    SETTLE, WIDTHS, Budget, Widths)
+    SELECTION, SETTLE, WIDTHS, Budget, Widths)
 from dataset import POS
 from discopy.neural.cells import POOL
 from model import Batches, POINTERS, SOLVERS
@@ -223,6 +223,8 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
                       hint_weight=budget.hint_weight,
                       settle=budget.settle, pointer=budget.pointer,
                       probe=budget.probe,
+                      feedback=budget.feedback, forcing=budget.forcing,
+                      trm=budget.trm,
                       solver=budget.solver, backward=budget.backward,
                       cache=4 + 2 * (1000 // max(budget.batch_size, 1)))
     if reuse and path.exists():
@@ -277,8 +279,18 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
         if epoch % budget.eval_every == 0 or epoch == budget.epochs:
             stats.update({f"val_{key}": value for key, value in
                           zoo.evaluate_split(model, valid).items()})
-            if stats["val_score"] > best["score"]:
-                best = {"score": stats["val_score"], "epoch": epoch}
+            # "deep" selection scores a candidate by min(val, val at the
+            # deepest sweep factor): a checkpoint that has reached the
+            # answer *and stays there*, read off the n = 16 validation
+            # split alone.  No out-of-distribution sample is touched here.
+            chosen = stats["val_score"]
+            if budget.selection == "deep":
+                stats["val_deep_score"] = zoo.evaluate_split(
+                    model, valid, factor=max(budget.sweep))["score"]
+                chosen = min(chosen, stats["val_deep_score"])
+            stats["val_selected"] = chosen
+            if chosen > best["score"]:
+                best = {"score": chosen, "epoch": epoch}
                 weights = {key: value.detach().cpu().clone()
                            for key, value in model.state_dict().items()}
             log(f"  {algorithm}/seed{seed} epoch {epoch:4d}: "
@@ -301,8 +313,11 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
         "rounds": [model.rounds_for(one) for one in train],
         "edge_state": budget.edge_state, "hint_weight": budget.hint_weight,
         "settle": budget.settle, "pointer": budget.pointer,
+        "selection": budget.selection,
         "pos": budget.pos, "solver": budget.solver, "probe": budget.probe,
-        "backward": budget.backward,
+        "backward": budget.backward, "feedback": budget.feedback,
+        "forcing": budget.forcing, "dense": budget.dense,
+        "trm": budget.trm,
     }
     torch.save(record, path)
     log(f"  {algorithm}/seed{seed}: best val {best['score']:.4f} at epoch "
@@ -323,6 +338,12 @@ def main(argv=None) -> int:
     parser.add_argument("--rounds", type=int, default=None,
                         help="a fixed depth, instead of the trajectory rule")
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--eval-every", dest="eval_every", type=int,
+                        default=None,
+                        help="epochs between validation passes, i.e. how "
+                             "densely best-val selection samples the run; "
+                             "it is part of the tag, so two cadences file "
+                             "separately")
     parser.add_argument("--hint-weight", dest="hint_weight", type=float,
                         default=None, help="0 for the output-only ablation")
     parser.add_argument("--node-only", action="store_true",
@@ -346,9 +367,26 @@ def main(argv=None) -> int:
                              "--settle is 'interior', which is what the "
                              "mixed campaign trained under and which cannot "
                              "reach the terminal checkpoint")
+    parser.add_argument("--selection", choices=[one for one in SELECTION
+                                               if one], default=None,
+                        help="what best-val selection maximises; 'deep' is "
+                             "min(val, val at 3x depth), still n = 16 only")
     parser.add_argument("--probe", action="store_true",
                         help="fit the hint heads on a detached state, i.e. "
                              "train the interaction on its output alone")
+    parser.add_argument("--feedback", choices=("state", ), default=None,
+                        help="re-encode hints into the state at every "
+                             "checkpoint boundary: the floor's closed "
+                             "loop, T-D's arm")
+    parser.add_argument("--forcing", type=float, default=None,
+                        help="the closed loop's teacher-forcing coin, "
+                             "0.5 by default")
+    parser.add_argument("--dense", action="store_true",
+                        help="the complete-graph diagram whatever the "
+                             "algorithm: the reference MPNN's wiring, "
+                             "T-C's arm")
+    parser.add_argument("--trm", action="store_true",
+                        help="the TRM arm: artifacts/trm-design.md")
     parser.add_argument("--solver", choices=sorted(SOLVERS),
                         default=None, help="the execution policy")
     parser.add_argument("--backward", choices=("full", "last"), default=None,
@@ -371,10 +409,11 @@ def main(argv=None) -> int:
         else QUICK if arguments.quick else FULL
     for key in ("epochs", "rounds", "lr", "pool", "widths",
                 "hint_weight", "pointer", "pos", "settle",
-                "solver", "backward", "n_train"):
+                "solver", "backward", "n_train", "feedback", "forcing",
+                "eval_every", "selection"):
         if getattr(arguments, key) is not None:
             budget = replace(budget, **{key: getattr(arguments, key)})
-    for key in ("mixed", "probe"):
+    for key in ("mixed", "probe", "dense", "trm"):
         if getattr(arguments, key):
             budget = replace(budget, **{key: True})
     if arguments.node_only:
@@ -385,6 +424,8 @@ def main(argv=None) -> int:
 
     summary: dict = {}
     for algorithm in arguments.algorithms:
+        if budget.dense:
+            dataset.densify(algorithm)
         splits = dataset.load_all(algorithm)
         # a Part 3 arm reads its size regime per row and refuses a row
         # that has not declared one; the probe that *decides* the regime

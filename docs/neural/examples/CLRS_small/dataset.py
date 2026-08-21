@@ -174,8 +174,22 @@ DIRECTED = ("dag_shortest_paths", )
 #: ``Pi`` over all pairs, ``s`` over all intervals -- so a pair that the
 #: sampled graph does not join still has an answer, and a model with one
 #: box per *sampled* edge would have nowhere to keep it.  This is the
-#: diagram H1 is asked on: one recurrent state per pair, or none.
-DENSE = ("floyd_warshall", "matrix_chain_order")
+#: diagram H1 is asked on: one recurrent state per pair, or none.  A set
+#: rather than a tuple so that :func:`densify` can extend it in place.
+DENSE = {"floyd_warshall", "matrix_chain_order"}
+
+
+def densify(algorithm: str) -> None:
+    """
+    Run *algorithm* on the complete-graph diagram from now on: the
+    reference MPNN's wiring (its ``adj_mat`` is overwritten with ones),
+    with the sampled graph entering as the ``adj`` edge feature instead.
+
+    In place, because every consumer -- :mod:`model` included -- holds a
+    binding to the one :data:`DENSE` set; call it before any
+    :class:`Split` is built, since :attr:`Split.edges` is cached.
+    """
+    DENSE.add(algorithm)
 
 #: The number of classes of each ``categorical`` probe.  CLRS one-hot
 #: encodes them, so the array carries a trailing class axis that no other
