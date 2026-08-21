@@ -5,6 +5,7 @@
 # figures drawn from them.
 *
 !.gitignore
+!*.md
 !config.py
 !dataset.py
 !evaluate.py

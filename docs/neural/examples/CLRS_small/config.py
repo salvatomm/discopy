@@ -333,6 +333,22 @@ class Budget:
               with the state detached at every checkpoint boundary
               (deep supervision), plus a detached soft-minimum halt
               head trained on per-node output correctness.
+        segment_steps : The algorithm steps one differentiated segment
+                        of the TRM-style *training loop* covers, ``0``
+                        for off.  Non-zero routes :func:`train.
+                        train_epoch` to :func:`train.train_epoch_
+                        segmented`: the run's total depth is the
+                        trajectory rule's, unchanged, but it is cut into
+                        segments of this many steps, each backpropagated
+                        in full from the previous segment's **detached**
+                        final state with the carried input families
+                        re-attached as :meth:`model.Grounded.ground`
+                        does, an output loss on **all** samples at every
+                        segment's end (deep supervision) and one
+                        optimizer step per segment.  A training-loop
+                        policy like ``probe``, so the model itself is
+                        untouched; unlike ``trm`` it builds no halt
+                        head.
     """
     name: str
     epochs: int
@@ -362,6 +378,7 @@ class Budget:
     forcing: float = 0.5
     dense: bool = False
     trm: bool = False
+    segment_steps: int = 0
 
     @property
     def tag(self) -> str:
@@ -389,6 +406,8 @@ class Budget:
         'full-fixedpoint-last'
         >>> replace(FULL, eval_every=1).tag
         'full-ev1'
+        >>> replace(FULL, probe=True, segment_steps=4).tag
+        'full-probe-seg4'
         """
         parts = [self.name]
         if self.widths != "mpnn":
@@ -414,6 +433,8 @@ class Budget:
             parts.append(f"sel{self.selection}")
         if self.probe:
             parts.append("probe")
+        if self.segment_steps:
+            parts.append(f"seg{self.segment_steps}")
         if self.feedback:
             parts.append("closed" if self.feedback == "state"
                          else f"closed-{self.feedback}")

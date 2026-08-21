@@ -119,6 +119,121 @@ def train_epoch(model, batches: Batches, optimizer, order=None) -> dict:
             **{key: value / steps for key, value in parts.items()}}
 
 
+def grounder(model) -> zoo.Grounded:
+    """
+    The carried-family re-attachment of the segmented loop, exactly
+    :class:`model.Grounded`'s: the input families ride on traced loops
+    *inside* the state, so a bare detach at a segment boundary would
+    sever the encoders from every segment's graph after the first.  The
+    carried tuple is the one :func:`model.build` hands the grounded
+    solver -- ``("node", FEAT)`` and, when the diagram has edge boxes,
+    ``("edge", WEIGHT)``.
+    """
+    return zoo.Grounded(carried=(("node", zoo.FEAT), ) + (
+        (("edge", zoo.WEIGHT), ) if zoo.has_edges(model.algorithm) else ()))
+
+
+def segment_loss(model, batch, every, start):
+    """
+    The deep-supervision loss of one segment: the **output** probes
+    decoded at the segment's final state and scored against the ground
+    -truth outputs for **all** samples -- every segment end predicts the
+    final answer, where :meth:`model.Model.loss` supervises the output
+    from a sample's own termination onwards -- plus the hint loss on the
+    steps the segment covers, under the model's own supervision regime
+    (detached from the interaction when ``probe``).
+
+    Parameters:
+        model : The model being trained.
+        batch : The batch being run.
+        every : The segment's checkpoints, one per algorithm step.
+        start : The zero-based algorithm step the segment starts at.
+
+    Returns:
+        The loss, and its parts as floats: ``output``, ``hint`` and one
+        ``probe/<name>`` per decoded probe.
+    """
+    names = zoo.probes(model.algorithm, "output")
+    output, hint, each = 0.0, 0.0, {}
+    prediction = model.decode(batch, every[-1], names=names)
+    for name in names:
+        term = model.decoders[name].loss(
+            prediction[name], batch.outputs[name])
+        output, each[name] = output + term, each.get(name, 0.0) + term
+    for step, found in enumerate(every, start=start):
+        targets = model.hint_targets(batch, step)
+        decoded = model.decode(
+            batch, found.detach() if model.probe else found,
+            names=list(targets)) if targets else {}
+        for name, (truth, alive) in targets.items():
+            term = model.decoders[name].loss(decoded[name][alive], truth)
+            hint, each[name] = hint + term, each.get(name, 0.0) + term
+    hint = hint / len(every)
+    return output + model.hint_weight * hint, {
+        "output": zoo._number(output), "hint": zoo._number(hint),
+        **{f"probe/{name}": zoo._number(term)
+           for name, term in each.items()}}
+
+
+def train_epoch_segmented(model, batches: Batches, optimizer,
+                          segment_steps: int, order=None) -> dict:
+    """
+    One pass over the batches, TRM-style: the run is cut into segments
+    of ``segment_steps`` algorithm steps -- the final one may be shorter
+    -- and every segment is its own truncated-backprop training step.
+
+    The total depth is :func:`train_epoch`'s, the trajectory rule's
+    rounds for the batch, unchanged.  Each segment starts from the
+    previous segment's final state, **detached**, with the carried input
+    families re-attached by :func:`grounder` -- the encoders are re-run
+    for every segment, since a backward pass consumes their forward
+    graph and a detach would otherwise sever them.  The segment's own
+    rounds are differentiated in full, its loss is
+    :func:`segment_loss`, and the optimizer steps once per segment, so
+    a batch takes ``ceil(steps / segment_steps)`` optimizer steps where
+    :func:`train_epoch` takes one.
+
+    Parameters:
+        model : The model to train.
+        batches : The training batches.
+        optimizer : The optimizer to step.
+        segment_steps : The algorithm steps one segment covers.
+        order : A ``numpy`` generator to shuffle the batch order with.
+
+    Returns:
+        The mean loss and its parts over the optimizer steps, and the
+        optimizer steps taken.
+    """
+    model.train()
+    indices = np.arange(len(batches))
+    if order is not None:
+        order.shuffle(indices)
+    total, parts, steps = 0.0, {}, 0
+    for index in indices:
+        batch = batches[index]
+        interaction = model.map.compile(batch.diagram)
+        state = None
+        for start in range(0, model.steps_of(batch), segment_steps):
+            state = model.initial(batch) if state is None else grounder(
+                model).ground(interaction, state, model.initial(batch))
+            stop = min(start + segment_steps, model.steps_of(batch))
+            every = model.checkpoints(model.map(
+                batch.diagram, state, deep=True,
+                rounds=model.hops * (stop - start)))
+            loss, found = segment_loss(model, batch, every, start)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+            state = every[-1]
+            total, steps = total + float(loss.detach()), steps + 1
+            for key, value in found.items():
+                parts[key] = parts.get(key, 0.0) + value
+    steps = max(steps, 1)
+    return {"loss": total / steps, "opt_steps": int(steps),
+            **{key: value / steps for key, value in parts.items()}}
+
+
 def per_probe(stats: dict) -> str:
     """ The ``probe/<name>`` terms of an epoch, as one line. """
     return "  ".join(f"{key.split('/', 1)[1]} {value:.4f}"
@@ -270,7 +385,10 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
                for key, value in model.state_dict().items()}
     tick = time.perf_counter()
     for epoch in range(1, budget.epochs + 1):
-        stats = train_epoch(model, train, optimizer, order)
+        stats = train_epoch_segmented(
+            model, train, optimizer, budget.segment_steps, order) \
+            if budget.segment_steps \
+            else train_epoch(model, train, optimizer, order)
         stats["epoch"] = epoch
         # the first epoch compiles, the rest must not: recorded from the
         # second, so that a cache one diagram too small cannot hide.
@@ -317,7 +435,7 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
         "pos": budget.pos, "solver": budget.solver, "probe": budget.probe,
         "backward": budget.backward, "feedback": budget.feedback,
         "forcing": budget.forcing, "dense": budget.dense,
-        "trm": budget.trm,
+        "trm": budget.trm, "segment_steps": budget.segment_steps,
     }
     torch.save(record, path)
     log(f"  {algorithm}/seed{seed}: best val {best['score']:.4f} at epoch "
@@ -387,6 +505,13 @@ def main(argv=None) -> int:
                              "T-C's arm")
     parser.add_argument("--trm", action="store_true",
                         help="the TRM arm: artifacts/trm-design.md")
+    parser.add_argument("--segment-steps", dest="segment_steps", type=int,
+                        default=None,
+                        help="cut the run into segments of this many "
+                             "algorithm steps, each differentiated in "
+                             "full from the previous one's detached end "
+                             "and its own optimizer step: the TRM-style "
+                             "segmented training loop, arm T of PART_A.md")
     parser.add_argument("--solver", choices=sorted(SOLVERS),
                         default=None, help="the execution policy")
     parser.add_argument("--backward", choices=("full", "last"), default=None,
@@ -410,7 +535,7 @@ def main(argv=None) -> int:
     for key in ("epochs", "rounds", "lr", "pool", "widths",
                 "hint_weight", "pointer", "pos", "settle",
                 "solver", "backward", "n_train", "feedback", "forcing",
-                "eval_every", "selection"):
+                "eval_every", "selection", "segment_steps"):
         if getattr(arguments, key) is not None:
             budget = replace(budget, **{key: getattr(arguments, key)})
     for key in ("mixed", "probe", "dense", "trm"):
