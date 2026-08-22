@@ -176,7 +176,9 @@ def segment_loss(model, batch, every, start):
 
 
 def train_epoch_segmented(model, batches: Batches, optimizer,
-                          segment_steps: int, order=None) -> dict:
+                          segment_steps: int, order=None,
+                          segment_optim: str = "per_segment",
+                          segment_detach: bool = True) -> dict:
     """
     One pass over the batches, TRM-style: the run is cut into segments
     of ``segment_steps`` algorithm steps -- the final one may be shorter
@@ -193,45 +195,90 @@ def train_epoch_segmented(model, batches: Batches, optimizer,
     a batch takes ``ceil(steps / segment_steps)`` optimizer steps where
     :func:`train_epoch` takes one.
 
+    Part B's two axes decompose that recipe (``PART_B.md``):
+
+    * ``segment_optim="per_batch"`` accumulates the **mean** of the
+      segment losses and steps the optimizer exactly **once per
+      batch**, so the supervision placement is the segmented one and
+      the step count is :func:`train_epoch`'s.  Under a detached
+      boundary each segment's mean-scaled loss is backpropagated as it
+      is produced -- the gradients accumulate, the graphs are freed --
+      and with the boundary attached the accumulated loss is
+      backpropagated once at the end of the batch.
+    * ``segment_detach=False`` keeps the state attached at a segment
+      boundary, so the backward pass flows through the whole run and
+      the carried re-attachment is a no-op (nothing was severed).  It
+      requires ``segment_optim="per_batch"``: stepping the optimizer
+      inside an attached graph would differentiate stale parameters.
+
     Parameters:
         model : The model to train.
         batches : The training batches.
         optimizer : The optimizer to step.
         segment_steps : The algorithm steps one segment covers.
         order : A ``numpy`` generator to shuffle the batch order with.
+        segment_optim : ``"per_segment"`` or ``"per_batch"``; see above.
+        segment_detach : Whether a segment boundary detaches; see above.
 
     Returns:
-        The mean loss and its parts over the optimizer steps, and the
+        The mean loss and its parts over the segments, and the
         optimizer steps taken.
     """
+    if segment_optim not in ("per_segment", "per_batch"):
+        raise ValueError(f"segment_optim is {segment_optim!r}, not one "
+                         f"of ('per_segment', 'per_batch')")
+    if not segment_detach and segment_optim != "per_batch":
+        raise ValueError("segment_detach=False needs "
+                         "segment_optim='per_batch': an optimizer step "
+                         "inside an attached graph would differentiate "
+                         "stale parameters")
+    per_batch = segment_optim == "per_batch"
     model.train()
     indices = np.arange(len(batches))
     if order is not None:
         order.shuffle(indices)
-    total, parts, steps = 0.0, {}, 0
+    total, parts, steps, segments = 0.0, {}, 0, 0
     for index in indices:
         batch = batches[index]
         interaction = model.map.compile(batch.diagram)
-        state = None
+        count = -(-model.steps_of(batch) // segment_steps)
+        if per_batch:
+            optimizer.zero_grad(set_to_none=True)
+        state, accumulated = None, 0.0
         for start in range(0, model.steps_of(batch), segment_steps):
-            state = model.initial(batch) if state is None else grounder(
-                model).ground(interaction, state, model.initial(batch))
+            state = model.initial(batch) if state is None else (
+                grounder(model).ground(
+                    interaction, state, model.initial(batch))
+                if segment_detach else state)
             stop = min(start + segment_steps, model.steps_of(batch))
             every = model.checkpoints(model.map(
                 batch.diagram, state, deep=True,
                 rounds=model.hops * (stop - start)))
             loss, found = segment_loss(model, batch, every, start)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            optimizer.step()
+            if not per_batch:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                               GRAD_CLIP)
+                optimizer.step()
+                steps += 1
+            elif segment_detach:
+                (loss / count).backward()
+            else:
+                accumulated = accumulated + loss / count
             state = every[-1]
-            total, steps = total + float(loss.detach()), steps + 1
+            total, segments = total + float(loss.detach()), segments + 1
             for key, value in found.items():
                 parts[key] = parts.get(key, 0.0) + value
-    steps = max(steps, 1)
-    return {"loss": total / steps, "opt_steps": int(steps),
-            **{key: value / steps for key, value in parts.items()}}
+        if per_batch:
+            if not segment_detach:
+                accumulated.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+            steps += 1
+    segments = max(segments, 1)
+    return {"loss": total / segments, "opt_steps": int(steps),
+            **{key: value / segments for key, value in parts.items()}}
 
 
 def per_probe(stats: dict) -> str:
@@ -386,7 +433,8 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
     tick = time.perf_counter()
     for epoch in range(1, budget.epochs + 1):
         stats = train_epoch_segmented(
-            model, train, optimizer, budget.segment_steps, order) \
+            model, train, optimizer, budget.segment_steps, order,
+            budget.segment_optim, budget.segment_detach) \
             if budget.segment_steps \
             else train_epoch(model, train, optimizer, order)
         stats["epoch"] = epoch
@@ -436,6 +484,8 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
         "backward": budget.backward, "feedback": budget.feedback,
         "forcing": budget.forcing, "dense": budget.dense,
         "trm": budget.trm, "segment_steps": budget.segment_steps,
+        "segment_optim": budget.segment_optim,
+        "segment_detach": budget.segment_detach,
     }
     torch.save(record, path)
     log(f"  {algorithm}/seed{seed}: best val {best['score']:.4f} at epoch "
@@ -512,6 +562,19 @@ def main(argv=None) -> int:
                              "full from the previous one's detached end "
                              "and its own optimizer step: the TRM-style "
                              "segmented training loop, arm T of PART_A.md")
+    parser.add_argument("--segment-optim", dest="segment_optim",
+                        choices=("per_segment", "per_batch"), default=None,
+                        help="when the segmented loop steps its optimizer: "
+                             "'per_segment' is arm T, 'per_batch' "
+                             "accumulates the mean of the segment losses "
+                             "and steps once per batch (tag 'acc')")
+    parser.add_argument("--no-segment-detach", dest="segment_detach",
+                        action="store_const", const=False, default=None,
+                        help="keep the state attached at segment "
+                             "boundaries, so backprop flows through the "
+                             "whole run and only the supervision placement "
+                             "changes (tag 'nodetach'); needs "
+                             "--segment-optim per_batch")
     parser.add_argument("--solver", choices=sorted(SOLVERS),
                         default=None, help="the execution policy")
     parser.add_argument("--backward", choices=("full", "last"), default=None,
@@ -535,7 +598,8 @@ def main(argv=None) -> int:
     for key in ("epochs", "rounds", "lr", "pool", "widths",
                 "hint_weight", "pointer", "pos", "settle",
                 "solver", "backward", "n_train", "feedback", "forcing",
-                "eval_every", "selection", "segment_steps"):
+                "eval_every", "selection", "segment_steps",
+                "segment_optim", "segment_detach"):
         if getattr(arguments, key) is not None:
             budget = replace(budget, **{key: getattr(arguments, key)})
     for key in ("mixed", "probe", "dense", "trm"):

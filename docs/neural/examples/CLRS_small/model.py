@@ -175,6 +175,85 @@ class Grounded(FixedPoint):
         return found, every or [found]
 
 
+class Anderson(Grounded):
+    """
+    Anderson acceleration over the same grounded one-step gradient: B4's
+    fairness repair for the arm whose maps converge but too slowly for
+    the trajectory's rounds (``PART_B.md``).
+
+    The no-grad loop keeps the last ``memory`` iterates and their
+    residuals :math:`g_i = T(s_i) - s_i` and, from the second round on,
+    replaces plain Picard iteration by the type-II Anderson mixture
+    :math:`s_{k+1} = \\sum_i \\alpha_i T(s_i)` with the weights solving
+    :math:`\\min \\|\\sum_i \\alpha_i g_i\\|` subject to
+    :math:`\\sum_i \\alpha_i = 1` (regularised normal equations).  The
+    carried input families are constant across iterates, so a mixture
+    whose weights sum to one carries them unchanged; the differentiated
+    final step is :class:`Grounded`'s own -- one round from the detached
+    mixture with the carried families re-attached by
+    :meth:`Grounded.ground` -- so the training arm differs from `F` in
+    the no-grad forward trajectory alone.  With ``memory=1`` there is
+    never anything to mix and the run is bitwise :class:`Grounded`'s,
+    which is the test's handle on it.
+
+    The weights are one vector for the whole flat state -- a batch is
+    one diagram, so the mixture is per batch rather than per sample --
+    and the least squares is solved on the residuals' Gram matrix with
+    a relative ridge of ``1e-8``.
+
+    Parameters:
+        rounds : The maximum rounds.
+        tol : The residual to stop at, ``None`` never to test.
+        inject : Whether every round re-adds the initial messages.
+        carried : The ``(generator, role)`` families to write back.
+        memory : The iterates the mixture may reach back over.
+    """
+    def __init__(self, rounds: int = 32, tol: float = None,
+                 inject: bool = False, carried=(), memory: int = 5):
+        super().__init__(rounds, tol, inject, carried)
+        self.memory = memory
+
+    def mixture(self, past, residuals):
+        """ The Anderson mixture of the past iterates, ``(rows, N)``. """
+        flat = torch.stack([one.reshape(-1) for one in residuals])
+        gram = flat @ flat.T
+        gram = gram + 1e-8 * float(gram.diagonal().mean())             * torch.eye(len(flat), dtype=gram.dtype, device=gram.device)
+        try:
+            weights = torch.linalg.solve(
+                gram, torch.ones(len(flat), 1, dtype=gram.dtype,
+                                 device=gram.device)).flatten()
+        except RuntimeError:
+            weights = torch.ones(len(flat), dtype=gram.dtype,
+                                 device=gram.device)
+        weights = weights / weights.sum()
+        return sum(weight * one for weight, one in zip(weights, past))
+
+    def run(self, interaction, state, deep: bool = False,
+            rounds: int = None, tol: float = None):
+        rounds = self.rounds if rounds is None else rounds
+        tol = self.tol if tol is None else tol
+        every, found, past, residuals = [], state, [], []
+        with torch.no_grad():
+            for _ in range(max(rounds - 1, 0)):
+                step = interaction.advance(found, 1, self.inject)
+                residual = step - found
+                past.append(step)
+                residuals.append(residual)
+                if len(past) > self.memory:
+                    past.pop(0)
+                    residuals.pop(0)
+                found = self.mixture(past, residuals)                     if len(past) > 1 else step
+                if deep:
+                    every.append(found)
+                if tol is not None and bool(residual.abs().amax() < tol):
+                    break
+        found = interaction.advance(
+            self.ground(interaction, found, state), 1, self.inject)
+        if deep:
+            every.append(found)
+        return found, every or [found]
+
+
 #: The solvers a budget may name, by the two policies a
 #: :class:`~discopy.neural.solver.Solver` carries: how many rounds to run,
 #: and which of them are in the autograd graph.
@@ -200,6 +279,8 @@ SOLVERS = {
     "fixedpoint": lambda backward, carried: FixedPoint(
         rounds=HOPS, tol=None, inject=False, backward=backward),
     "grounded": lambda backward, carried: Grounded(
+        rounds=HOPS, tol=None, inject=False, carried=carried),
+    "anderson": lambda backward, carried: Anderson(
         rounds=HOPS, tol=None, inject=False, carried=carried),
 }
 

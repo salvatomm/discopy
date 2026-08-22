@@ -240,7 +240,8 @@ def residuals(model, batches, factor: float = 1.0) -> dict:
 
 
 @torch.no_grad()
-def residual_curve(model, batches, factor: float = 1.0) -> list:
+def residual_curve(model, batches, factor: float = 1.0,
+                   rounds: int = None) -> list:
     """
     :math:`\\|T(s_r) - s_r\\|_\\infty` after *every* round, averaged over
     the batches of a split.
@@ -262,6 +263,9 @@ def residual_curve(model, batches, factor: float = 1.0) -> list:
         model : The trained model.
         batches : The :class:`~model.Batches` to run.
         factor : The multiple of the trained depth to run at.
+        rounds : A fixed round count instead of the factor -- what B4's
+                 much-deeper probe asks for, since "512 rounds" is a
+                 question about the map and not about the trajectory.
 
     Returns:
         One residual per *round*, so its length is ``HOPS`` times the
@@ -274,10 +278,126 @@ def residual_curve(model, batches, factor: float = 1.0) -> list:
     for batch in batches:
         interaction = model.map.compile(batch.diagram)
         every = model.map(batch.diagram, model.initial(batch), deep=True,
-                          rounds=model.rounds_for(batch, factor))
+                          rounds=rounds or model.rounds_for(batch, factor))
         curves.append([float(interaction.residual(state).max())
                        for state in every])
     return [float(np.mean(round_)) for round_ in zip(*curves)]
+
+
+@torch.no_grad()
+def churn_curve(model, batches, factor: float = 1.0) -> dict:
+    """
+    Per checkpoint, the fraction of **output elements whose decoded
+    prediction changed** since the checkpoint before: whether the
+    *answers* settle, which the latent residual beside it cannot say.
+
+    Part B's B2 metric, defined before any scoring (``PART_B.md``): at
+    each checkpoint of a deep run, decode the output probes; churn at
+    checkpoint ``k`` is the fraction of output elements whose decoded
+    prediction differs from checkpoint ``k - 1`` -- an ``argmax`` change
+    for a pointer, ``mask_one`` or categorical probe, a crossing of
+    logit ``0`` for a mask probe -- pooled over those discrete probes;
+    a scalar probe is reported separately as the mean ``|delta|`` and
+    never pooled, since it has no discrete prediction to change.
+
+    A run's checkpoints may outnumber another batch's -- the trajectory
+    rule makes the depth a property of the batch -- so entry ``k`` pools
+    over the batches that reach checkpoint ``k + 1`` at all.
+
+    Parameters:
+        model : The trained model.
+        batches : The :class:`~model.Batches` to run.
+        factor : The multiple of the trained depth to run at.
+
+    Returns:
+        ``"churn"``, one fraction per checkpoint from the second on
+        (entry ``k`` compares checkpoint ``k + 1`` with ``k``);
+        ``"per_probe"``, the same split by discrete probe; and
+        ``"scalar"``, the mean ``|delta|`` per scalar probe.
+    """
+    model.eval()
+    names = probes(model.algorithm, "output")
+    kinds = {name: kind(model.algorithm, name)[1] for name in names}
+    changed, deltas = {}, {}
+    for batch in batches:
+        every = model.run(batch, deep=True, factor=factor)
+        hard = []
+        for state in every:
+            prediction = model.decode(batch, state, names=list(names))
+            hard.append({
+                name: prediction[name] if kinds[name] == "scalar"
+                else prediction[name] > 0 if kinds[name] == "mask"
+                else prediction[name].argmax(-1) for name in names})
+        for k in range(1, len(hard)):
+            for name in names:
+                if kinds[name] == "scalar":
+                    delta = (hard[k][name] - hard[k - 1][name]).abs()
+                    count = deltas.setdefault(name, {}).setdefault(
+                        k, [0.0, 0])
+                    count[0] += float(delta.sum())
+                    count[1] += delta.numel()
+                else:
+                    moved = hard[k][name] != hard[k - 1][name]
+                    count = changed.setdefault(name, {}).setdefault(
+                        k, [0, 0])
+                    count[0] += int(moved.sum())
+                    count[1] += moved.numel()
+    depth = max((max(one) for one in (*changed.values(),
+                                      *deltas.values())), default=0)
+    pooled = [sum(one[k][0] for one in changed.values() if k in one)
+              / max(sum(one[k][1] for one in changed.values()
+                        if k in one), 1) for k in range(1, depth + 1)]
+    return {
+        "churn": pooled,
+        "per_probe": {name: [one[k][0] / max(one[k][1], 1) if k in one
+                             else None for k in range(1, depth + 1)]
+                      for name, one in changed.items()},
+        "scalar": {name: [one[k][0] / max(one[k][1], 1) if k in one
+                          else None for k in range(1, depth + 1)]
+                   for name, one in deltas.items()},
+    }
+
+
+def churn_report(algorithm: str, budget: Budget, seeds=None, device=None,
+                 log=print) -> dict:
+    """
+    Retrofit :func:`churn_curve` onto a written report: load each seed's
+    weights from ``artifacts/`` -- no retraining -- compute the churn
+    curves on ``val`` and on the canonical out-of-distribution split at
+    the deepest factor of the budget's sweep (the one the report's
+    residual curves already use), write them into the report's rows and
+    rewrite the file.
+
+    Parameters:
+        algorithm : The algorithm.
+        budget : The budget the models were trained under.
+        seeds : The seeds to score, the budget's by default.
+        device : Where to run, the GPU by default.
+        log : Where to print progress.
+    """
+    device = training.default_device() if device is None else device
+    path = ARTIFACTS / f"{budget.tag}-{algorithm}-report.json"
+    found = json.loads(path.read_text())
+    splits = dataset.load_all(algorithm)
+    batches = {name: zoo.Batches(splits[name], budget.eval_batch_size,
+                                 device) for name in ("val", "test")}
+    deepest = max(budget.sweep)
+    rows = {row["seed"]: row for row in found["seeds"]}
+    for seed in (seeds or budget.seeds):
+        model, _ = training.train_model(
+            algorithm, budget, seed, device=device, splits=splits)
+        zoo.fit_cache(model, *batches.values())
+        rows[seed]["churn"] = {
+            "factor": deepest,
+            "val": churn_curve(model, batches["val"], deepest),
+            "ood": churn_curve(model, batches["test"], deepest),
+        }
+        log(f"  {algorithm}/seed{seed} churn (x{deepest:g}):"
+            f"  val last {rows[seed]['churn']['val']['churn'][-1]:.4f}"
+            f"  ood last {rows[seed]['churn']['ood']['churn'][-1]:.4f}")
+    path.write_text(json.dumps(found, indent=2))
+    log(f"  {algorithm}: churn -> {path.name}")
+    return found
 
 
 @torch.no_grad()
@@ -444,6 +564,377 @@ def selection_report(algorithm: str, budget: Budget, seeds, ks, sigma: float,
     return found
 
 
+# --- Part B: post-hoc halting and best-of-k (B3) ---------------------------
+#
+# Everything here reads FROZEN weights: the interaction is never retrained,
+# so the training arms stay what Part A trained and the comparison stays
+# one axis wide.  The halt probe is fit on the training split's
+# checkpoints, its threshold is calibrated on the validation split, and
+# the test and WIDE splits are only ever *scored*; ``PART_B.md`` records
+# the definitions verbatim.
+
+#: The post-hoc halt probe's one hidden layer, its fitting budget, and
+#: the calibration grid of halt thresholds, as sigmoid probabilities.
+HALT_HIDDEN = 64
+HALT_EPOCHS = 200
+HALT_LR = 1e-3
+HALT_THRESHOLDS = tuple(round(0.05 * i, 2) for i in range(1, 20))
+
+
+class HaltProbe(torch.nn.Module):
+    """
+    B3's per-sample halt head: one hidden layer reading the readout
+    relation's state concatenated with the mean-pooled node states, all
+    detached, one logit per sample.  Post-hoc -- it never feeds back into
+    the run and its gradient never reaches the interaction.
+    """
+    def __init__(self, dim: int, hidden: int = HALT_HIDDEN):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(dim, hidden), torch.nn.ReLU(),
+            torch.nn.Linear(hidden, 1))
+
+    def forward(self, features):
+        return self.net(features).squeeze(-1)
+
+
+@torch.no_grad()
+def halt_features(model, batch, state):
+    """
+    What the probe reads at one checkpoint, ``(samples, graph_dim +
+    state_dim)``: the readout relation's state beside the mean-pooled
+    node states, detached.
+    """
+    interaction = model.map.compile(batch.diagram)
+    graph = interaction.read(state, ("readout", zoo.GSTATE)).reshape(
+        len(batch), -1)
+    return torch.cat([graph, model.states(batch, state).mean(dim=1)],
+                     dim=-1).detach()
+
+
+@torch.no_grad()
+def halt_fraction(model, batch, state):
+    """
+    The probe's soft target at one checkpoint, ``(samples, )``: the
+    fraction of the sample's output elements currently decoded correct,
+    via :meth:`model.Model.correctness`.
+    """
+    names = probes(model.algorithm, "output")
+    return model.correctness(
+        model=None, batch=batch, prediction=None) if False else         model.correctness(batch, model.decode(
+            batch, state, names=names)).float().mean(dim=1)
+
+
+def fit_halt(model, batches, factor: float = 3.0, seed: int = 0,
+             log=print) -> tuple:
+    """
+    Fit the halt probe on the checkpoints of the **training** split of
+    the frozen model: one deep run per batch at ``factor``, the features
+    and the fraction-correct target collected at every checkpoint, then
+    BCE-with-logits against the soft target, full-batch Adam.
+
+    Parameters:
+        model : The frozen model.
+        batches : The training split's batches.
+        factor : The multiple of the trained depth the checkpoints of
+                 which the probe learns from -- the deployment depth.
+        seed : The probe's own initialisation seed.
+        log : Where to print progress.
+
+    Returns:
+        The fitted probe and its fitting record.
+    """
+    model.eval()
+    xs, ys = [], []
+    with torch.no_grad():
+        for batch in batches:
+            for state in model.run(batch, deep=True, factor=factor):
+                xs.append(halt_features(model, batch, state))
+                ys.append(halt_fraction(model, batch, state))
+    features, targets = torch.cat(xs), torch.cat(ys)
+    torch.manual_seed(seed)
+    probe = HaltProbe(features.shape[-1])
+    optimizer = torch.optim.Adam(probe.parameters(), lr=HALT_LR)
+    criterion = torch.nn.BCEWithLogitsLoss()
+    loss = None
+    for _ in range(HALT_EPOCHS):
+        optimizer.zero_grad()
+        loss = criterion(probe(features), targets)
+        loss.backward()
+        optimizer.step()
+    record = {"rows": int(len(features)), "dim": int(features.shape[-1]),
+              "hidden": HALT_HIDDEN, "epochs": HALT_EPOCHS, "lr": HALT_LR,
+              "factor": factor, "final_loss": float(loss.detach()),
+              "target_mean": float(targets.mean())}
+    log(f"    halt probe: {record['rows']} rows, final BCE "
+        f"{record['final_loss']:.4f}")
+    return probe, record
+
+
+def _threshold_logit(probability: float) -> float:
+    """ The logit a sigmoid probability threshold crosses at. """
+    return float(np.log(probability / (1.0 - probability)))
+
+
+@torch.no_grad()
+def halted(model, probe, batches, factor: float,
+           thresholds=HALT_THRESHOLDS) -> dict:
+    """
+    Adaptive halting at every candidate threshold in one pass: run deep
+    at ``factor``, compute the halt logit at every checkpoint, and per
+    threshold stop each sample at its first crossing -- the final
+    checkpoint when it never crosses -- then score the halted
+    predictions pooled over the split.
+
+    Parameters:
+        model : The frozen model.
+        probe : The fitted :class:`HaltProbe`.
+        batches : The split to score.
+        factor : The multiple of the trained depth to run at.
+        thresholds : The candidate sigmoid thresholds.
+
+    Returns:
+        Per threshold, the pooled halted score and the mean checkpoint
+        halted at (one-based).
+    """
+    model.eval()
+    names = probes(model.algorithm, "output")
+    pooled = {t: {name: ([], []) for name in names} for t in thresholds}
+    stops = {t: [] for t in thresholds}
+    for batch in batches:
+        every = model.run(batch, deep=True, factor=factor)
+        logits = torch.stack(
+            [probe(halt_features(model, batch, state)) for state in every])
+        decoded = [model.decode(batch, state, names=names)
+                   for state in every]
+        stacked = {name: torch.stack([one[name] for one in decoded])
+                   for name in names}
+        rows = torch.arange(len(batch))
+        for t in thresholds:
+            crossed = logits > _threshold_logit(t)
+            index = torch.where(
+                crossed.any(dim=0), crossed.float().argmax(dim=0),
+                torch.full((len(batch), ), len(every) - 1))
+            stops[t].extend((index + 1).tolist())
+            for name in names:
+                pooled[t][name][0].append(
+                    stacked[name][index, rows].cpu().numpy())
+                pooled[t][name][1].append(
+                    batch.outputs[name].cpu().numpy())
+    return {t: {
+        "score": zoo.score(model.algorithm, {
+            name: tuple(np.concatenate(stack) for stack in pair)
+            for name, pair in pooled[t].items()})["score"],
+        "mean_stop": float(np.mean(stops[t]))} for t in thresholds}
+
+
+@torch.no_grad()
+def _sample_churn(model, prediction, previous) -> "torch.Tensor":
+    """
+    Per sample, the fraction of discrete output elements whose decoded
+    prediction changed between the run's last two checkpoints: the
+    best-of-k churn selector, lower is more settled.
+    """
+    changed, total = None, 0
+    for name in probes(model.algorithm, "output"):
+        what = kind(model.algorithm, name)[1]
+        if what == "scalar":
+            continue
+        now, then = prediction[name], previous[name]
+        moved = ((now > 0) != (then > 0)) if what == "mask"             else (now.argmax(-1) != then.argmax(-1))
+        moved = moved.reshape(len(moved), -1)
+        changed = moved.float().sum(dim=1) if changed is None             else changed + moved.float().sum(dim=1)
+        total += moved.shape[1]
+    return changed / max(total, 1)
+
+
+@torch.no_grad()
+def best_of_k(model, probe, batches, k: int, sigma: float,
+              factor: float = 1.0) -> dict:
+    """
+    B3's best-of-``k``: per batch, ``k`` rollouts -- the first
+    noiseless, the rest with Gaussian noise ``sigma`` written **onto
+    the initial node-state family alone** -- each run to the trajectory
+    rule's depth at ``factor``; per sample, four selectors choose one
+    rollout's final prediction and the pooled choices are scored.
+
+    Selectors: ``halt`` (highest final halt logit), ``residual``
+    (lowest final node-state residual, the per-sample infinity-norm of
+    ``T(s) - s`` restricted to the ``("node", STATE)`` family),
+    ``churn`` (lowest fraction of discrete output elements changed
+    between the last two checkpoints) and ``oracle`` (highest true
+    fraction correct -- the upper bound, it reads the ground truth).
+    ``first`` is the deterministic rollout alone, and ``control`` is
+    the compute-matched single deterministic rollout at ``k`` times the
+    factor -- the same total round budget spent on depth instead of
+    restarts.
+
+    Parameters:
+        model : The frozen model.
+        probe : The fitted :class:`HaltProbe`.
+        batches : The split to score.
+        k : The rollouts per batch.
+        sigma : The noise scale on the initial node states.
+        factor : The multiple of the trained depth each rollout runs at.
+    """
+    model.eval()
+    names = probes(model.algorithm, "output")
+    selectors = ("halt", "residual", "churn", "oracle")
+    pooled = {sel: {name: ([], []) for name in names}
+              for sel in (*selectors, "first", "control")}
+    for batch in batches:
+        interaction = model.map.compile(batch.diagram)
+        rows = torch.arange(len(batch))
+        merit = {sel: [] for sel in selectors}
+        candidates = {name: [] for name in names}
+        for rollout in range(k):
+            state = model.initial(batch)
+            if rollout and sigma:
+                family = interaction.read(state, ("node", zoo.STATE))
+                state = interaction.write(
+                    state, ("node", zoo.STATE),
+                    family + sigma * torch.randn_like(family))
+            every = model.run(batch, state=state, deep=True,
+                              factor=factor)
+            final = every[-1]
+            prediction = model.decode(batch, final, names=names)
+            previous = model.decode(batch, every[-2], names=names)                 if len(every) > 1 else prediction
+            residual = interaction.read(
+                interaction.advance(final, 1, False) - final,
+                ("node", zoo.STATE)).reshape(
+                    len(batch), batch.size, -1).abs().amax(dim=(1, 2))
+            merit["halt"].append(probe(halt_features(model, batch, final)))
+            merit["residual"].append(-residual)
+            merit["churn"].append(
+                -_sample_churn(model, prediction, previous))
+            merit["oracle"].append(halt_fraction(model, batch, final))
+            for name in names:
+                candidates[name].append(prediction[name])
+            if rollout == 0:
+                for name in names:
+                    pooled["first"][name][0].append(
+                        prediction[name].cpu().numpy())
+                    pooled["first"][name][1].append(
+                        batch.outputs[name].cpu().numpy())
+        stacked = {name: torch.stack(one)
+                   for name, one in candidates.items()}
+        for sel in selectors:
+            index = torch.stack(merit[sel]).argmax(dim=0)
+            for name in names:
+                pooled[sel][name][0].append(
+                    stacked[name][index, rows].cpu().numpy())
+                pooled[sel][name][1].append(
+                    batch.outputs[name].cpu().numpy())
+        control = model.decode(batch, model.run(
+            batch, deep=False, factor=k * factor)[-1], names=names)
+        for name in names:
+            pooled["control"][name][0].append(control[name].cpu().numpy())
+            pooled["control"][name][1].append(
+                batch.outputs[name].cpu().numpy())
+    return {sel: zoo.score(model.algorithm, {
+        name: tuple(np.concatenate(stack) for stack in pair)
+        for name, pair in found.items()})["score"]
+        for sel, found in pooled.items()}
+
+
+def halting_report(algorithm: str, budget: Budget, seeds=None,
+                   device=None, k: int = 8, sigmas=(0.01, 0.1),
+                   factor: float = 3.0, log=print) -> dict:
+    """
+    B3's whole protocol on the frozen weights of one arm, written to
+    ``<tag>-<algorithm>-partb-halting.json``: fit the halt probe on the
+    training split's checkpoints, calibrate its threshold on the
+    validation split (the threshold maximising the halted validation
+    score at ``factor``), then score adaptive halting at ``factor`` and
+    best-of-``k`` (noise ``sigma`` chosen on the validation split as
+    the one maximising the best non-oracle selector) on the canonical
+    and WIDE out-of-distribution splits -- which are never read before
+    this last step.
+
+    Parameters:
+        algorithm : The algorithm.
+        budget : The budget the frozen models were trained under.
+        seeds : The seeds to score, the budget's by default.
+        device : Where to run, the GPU by default.
+        k : The rollouts of best-of-``k``.
+        sigmas : The candidate noise scales, swept on validation.
+        factor : The adaptive-halting depth, the deepest of the sweep.
+        log : Where to print progress.
+    """
+    device = training.default_device() if device is None else device
+    splits = dataset.load_all(algorithm)
+    splits["wide"] = splits["wide"].subsample(budget.n_wide)
+    batches = {name: zoo.Batches(splits[name], budget.eval_batch_size,
+                                 device)
+               for name in ("val", "test", "wide")}
+    fitting = zoo.Batches(splits["train"], budget.batch_size, device)
+    rows = []
+    for seed in (seeds or budget.seeds):
+        log(f"  {algorithm}/seed{seed}:")
+        model, _ = training.train_model(
+            algorithm, budget, seed, device=device, splits=splits)
+        zoo.fit_cache(model, fitting, *batches.values())
+        probe, fitted = fit_halt(model, fitting, factor, seed)
+        calibration = halted(model, probe, batches["val"], factor)
+        threshold = max(calibration, key=lambda t: calibration[t]["score"])
+        chosen = calibration[threshold]
+        log(f"    threshold {threshold} (val {chosen['score']:.4f}, "
+            f"mean stop {chosen['mean_stop']:.1f})")
+        sweep_val = {sigma: best_of_k(
+            model, probe, batches["val"], k, sigma) for sigma in sigmas}
+        best_non_oracle = {
+            sigma: max(found[sel] for sel in ("halt", "residual", "churn"))
+            for sigma, found in sweep_val.items()}
+        sigma = max(best_non_oracle, key=best_non_oracle.get)
+        log(f"    sigma {sigma} (best non-oracle val "
+            f"{best_non_oracle[sigma]:.4f})")
+        row = {
+            "seed": seed, "probe": fitted, "threshold": threshold,
+            "calibration": {str(t): one for t, one in calibration.items()},
+            "sigma": sigma,
+            "sigma_sweep_val": {str(s): one
+                                for s, one in sweep_val.items()},
+            "halted": {name: {str(threshold): one for threshold, one in
+                              halted(model, probe, batches[name], factor,
+                                     (threshold, )).items()}
+                       for name in ("test", "wide")},
+            "fixed": {name: {
+                "x1": zoo.evaluate_split(model, batches[name])["score"],
+                f"x{factor:g}": zoo.evaluate_split(
+                    model, batches[name], factor=factor)["score"]}
+                for name in ("test", "wide")},
+            "best_of_k": {name: best_of_k(model, probe, batches[name],
+                                          k, sigma)
+                          for name in ("test", "wide")},
+        }
+        rows.append(row)
+        wide = row["halted"]["wide"][str(threshold)]["score"]
+        log(f"    halted wide {wide:.4f} vs fixed x1 "
+            f"{row['fixed']['wide']['x1']:.4f} / x{factor:g} "
+            f"{row['fixed']['wide'][f'x{factor:g}']:.4f}")
+        log("    best-of-k wide: " + "  ".join(
+            f"{sel} {value:.4f}"
+            for sel, value in row["best_of_k"]["wide"].items()))
+    found = {"algorithm": algorithm, "budget": budget.tag, "k": k,
+             "factor": factor,
+             "protocol": {
+                 "fit": "train split checkpoints at the halting factor, "
+                        "soft BCE on the fraction of output elements "
+                        "correct, probe detached",
+                 "calibrate": "threshold maximising halted val score; "
+                              "sigma maximising the best non-oracle "
+                              "selector on val",
+                 "noise": "Gaussian on the initial node-state family "
+                          "alone, first rollout noiseless",
+                 "control": "one deterministic rollout at k times the "
+                            "factor: the same total rounds"},
+             "seeds": rows}
+    path = ARTIFACTS / f"{budget.tag}-{algorithm}-partb-halting.json"
+    path.write_text(json.dumps(found, indent=2))
+    log(f"  {algorithm}: -> {path.name}")
+    return found
+
+
 # --- the report ------------------------------------------------------------
 
 def report(algorithm: str, budget: Budget = FULL, seeds=None, device=None,
@@ -490,6 +981,11 @@ def report(algorithm: str, budget: Budget = FULL, seeds=None, device=None,
                 "trained_at": record.get("depth"),
                 "val": residual_curve(model, batches["val"], deepest),
                 "ood": residual_curve(model, batches["test"], deepest),
+            },
+            "churn": {
+                "factor": deepest,
+                "val": churn_curve(model, batches["val"], deepest),
+                "ood": churn_curve(model, batches["test"], deepest),
             },
             "hints": {"val": hint_curve(model, batches["val"]),
                       "ood": hint_curve(model, batches["test"])},
@@ -1380,6 +1876,25 @@ def main(argv=None) -> int:
                              "see train.py")
     parser.add_argument("--trm", action="store_true",
                         help="the TRM arm: artifacts/trm-design.md")
+    parser.add_argument("--segment-steps", dest="segment_steps", type=int,
+                        default=None,
+                        help="the segmented training loop's segment "
+                             "length; part of the tag, see train.py")
+    parser.add_argument("--segment-optim", dest="segment_optim",
+                        choices=("per_segment", "per_batch"), default=None,
+                        help="when the segmented loop stepped its "
+                             "optimizer; part of the tag, see train.py")
+    parser.add_argument("--no-segment-detach", dest="segment_detach",
+                        action="store_const", const=False, default=None,
+                        help="the attached-boundary segmented arm; part "
+                             "of the tag, see train.py")
+    parser.add_argument("--churn", action="store_true",
+                        help="retrofit the output-churn curves onto a "
+                             "written report, loading weights only")
+    parser.add_argument("--halting", action="store_true",
+                        help="B3 on the frozen weights: fit the halt "
+                             "probe on train, calibrate on val, score "
+                             "adaptive halting and best-of-k")
     parser.add_argument("--select", type=int, nargs="*", default=None,
                         help="halt-selection rollout counts, e.g. 1 4 16")
     parser.add_argument("--sigma", type=float, default=0.1,
@@ -1404,7 +1919,8 @@ def main(argv=None) -> int:
     for key in ("epochs", "rounds", "pool", "widths",
                 "hint_weight", "pointer", "pos", "settle",
                 "solver", "backward", "n_train", "feedback", "forcing",
-                "eval_every", "selection"):
+                "eval_every", "selection", "segment_steps",
+                "segment_optim", "segment_detach"):
         if getattr(arguments, key) is not None:
             budget = replace(budget, **{key: getattr(arguments, key)})
     for key in ("mixed", "probe", "dense", "trm"):
@@ -1416,6 +1932,14 @@ def main(argv=None) -> int:
         for algorithm in arguments.algorithms:
             dataset.densify(algorithm)
     device = torch.device(arguments.device) if arguments.device else None
+    if arguments.churn:
+        for algorithm in arguments.algorithms:
+            churn_report(algorithm, budget, arguments.seeds, device)
+        return 0
+    if arguments.halting:
+        for algorithm in arguments.algorithms:
+            halting_report(algorithm, budget, arguments.seeds, device)
+        return 0
     if arguments.select:
         for algorithm in arguments.algorithms:
             selection_report(algorithm, budget, arguments.seeds,

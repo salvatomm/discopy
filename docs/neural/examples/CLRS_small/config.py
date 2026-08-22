@@ -349,6 +349,28 @@ class Budget:
                         policy like ``probe``, so the model itself is
                         untouched; unlike ``trm`` it builds no halt
                         head.
+        segment_optim : When the segmented loop steps its optimizer.
+                        ``"per_segment"`` -- the default, arm T of
+                        ``PART_A.md`` -- steps once per segment, so a
+                        batch takes ``ceil(steps / segment_steps)``
+                        steps; ``"per_batch"`` accumulates the **mean**
+                        of the segment losses and steps **once per
+                        batch**, so the supervision is T's and the step
+                        count is O's.  Part B's B1 axis: read only when
+                        ``segment_steps`` is non-zero, tagged ``acc``
+                        only then and only when non-default.
+        segment_detach : Whether the state is detached at a segment
+                         boundary.  ``True`` is the default and arm T:
+                         each segment backpropagates through its own
+                         rounds alone, from a detached state with the
+                         carried families re-attached.  ``False`` keeps
+                         the state attached, so the backward pass flows
+                         through the whole run and the re-attachment is
+                         a no-op -- segmentation then changes only
+                         *where* the output loss is placed.  Part B's
+                         other B1 axis: read only when ``segment_steps``
+                         is non-zero, tagged ``nodetach`` only then and
+                         only when non-default.
     """
     name: str
     epochs: int
@@ -379,6 +401,8 @@ class Budget:
     dense: bool = False
     trm: bool = False
     segment_steps: int = 0
+    segment_optim: str = "per_segment"
+    segment_detach: bool = True
 
     @property
     def tag(self) -> str:
@@ -408,6 +432,11 @@ class Budget:
         'full-ev1'
         >>> replace(FULL, probe=True, segment_steps=4).tag
         'full-probe-seg4'
+        >>> replace(FULL, segment_steps=4, segment_optim="per_batch").tag
+        'full-seg4-acc'
+        >>> replace(FULL, segment_steps=4, segment_optim="per_batch",
+        ...         segment_detach=False).tag
+        'full-seg4-acc-nodetach'
         """
         parts = [self.name]
         if self.widths != "mpnn":
@@ -435,6 +464,10 @@ class Budget:
             parts.append("probe")
         if self.segment_steps:
             parts.append(f"seg{self.segment_steps}")
+            if self.segment_optim != "per_segment":
+                parts.append("acc")
+            if not self.segment_detach:
+                parts.append("nodetach")
         if self.feedback:
             parts.append("closed" if self.feedback == "state"
                          else f"closed-{self.feedback}")
