@@ -137,6 +137,17 @@ SETTLE = (None, "interior", "terminal")
 #: every number this study measured before 2026-08-19.
 SELECTION = (None, "deep")
 
+#: How a run decides its depth; see :attr:`Budget.depth_rule`.
+DEPTH_RULES = ("trajectory", "sized")
+
+#: The test-time depth sweep of a *sized* run, as factors on the sized
+#: depth rather than on any trajectory: Part D's ladder.  Half the sized
+#: depth, the sized depth itself, and half again past it -- the deepest
+#: rung asks whether a map trained to hold its answer for ``2n`` steps
+#: holds it past them, which is the settling question at the resolution
+#: a length-free run can afford.
+SIZED_SWEEP = (0.5, 1.0, 1.5)
+
 
 def holding(settle) -> str:
     """
@@ -371,6 +382,24 @@ class Budget:
                          other B1 axis: read only when ``segment_steps``
                          is non-zero, tagged ``nodetach`` only then and
                          only when non-default.
+        depth_rule : How every run of the budget -- training, validation
+                     and evaluation alike -- decides its depth, a member
+                     of :data:`DEPTH_RULES`.  ``"trajectory"`` is the
+                     default and every number before Part D: rounds are
+                     read off ``batch.lengths``, the ground-truth
+                     per-sample step counts, which is information the
+                     deep-equilibrium literature says its models do not
+                     need.  ``"sized"`` is Part D's length-free regime:
+                     the depth is ``model.SIZED * n`` algorithm steps
+                     where ``n`` is the batch's node count -- an input
+                     every model reads -- so a worst-case bound in the
+                     size replaces the per-sample leak, and
+                     ``batch.lengths`` may not influence a run's depth,
+                     loss or evaluation in any way (the hint loss, which
+                     is indexed by the trajectory clock, is therefore
+                     dropped; the arms are output-only regardless).  Tag
+                     component ``szd``, appended only when non-default;
+                     see ``PART_D.md``.
     """
     name: str
     epochs: int
@@ -403,6 +432,7 @@ class Budget:
     segment_steps: int = 0
     segment_optim: str = "per_segment"
     segment_detach: bool = True
+    depth_rule: str = "trajectory"
 
     @property
     def tag(self) -> str:
@@ -437,6 +467,11 @@ class Budget:
         >>> replace(FULL, segment_steps=4, segment_optim="per_batch",
         ...         segment_detach=False).tag
         'full-seg4-acc-nodetach'
+        >>> replace(FULL, segment_steps=4, segment_optim="per_batch",
+        ...         depth_rule="sized").tag
+        'full-seg4-acc-szd'
+        >>> replace(FULL, depth_rule="sized", solver="grounded").tag
+        'full-szd-grounded'
         """
         parts = [self.name]
         if self.widths != "mpnn":
@@ -468,6 +503,8 @@ class Budget:
                 parts.append("acc")
             if not self.segment_detach:
                 parts.append("nodetach")
+        if self.depth_rule != "trajectory":
+            parts.append("szd")
         if self.feedback:
             parts.append("closed" if self.feedback == "state"
                          else f"closed-{self.feedback}")

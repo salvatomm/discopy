@@ -44,8 +44,9 @@ import dataset
 import model as zoo
 import train as training
 from config import (
-    ALGORITHMS, ANCHORS, ANCHOR_SOURCE, ARTIFACTS, FULL, H2_ARMS,
-    ORDER_DEPENDENT, ORDER_FREE, QUICK, SETTLE, WIDTHS, Budget)
+    ALGORITHMS, ANCHORS, ANCHOR_SOURCE, ARTIFACTS, DEPTH_RULES, FULL,
+    H2_ARMS, ORDER_DEPENDENT, ORDER_FREE, QUICK, SETTLE, SIZED_SWEEP,
+    WIDTHS, Budget)
 from dataset import DIRECTED, POS, kind, probes
 from discopy.neural import check_equivariant
 from discopy.neural.cells import POOL
@@ -987,11 +988,23 @@ def report(algorithm: str, budget: Budget = FULL, seeds=None, device=None,
                 "val": churn_curve(model, batches["val"], deepest),
                 "ood": churn_curve(model, batches["test"], deepest),
             },
-            "hints": {"val": hint_curve(model, batches["val"]),
-                      "ood": hint_curve(model, batches["test"])},
+            # a sized run may not read the trajectory clock, and its hint
+            # decoders receive no gradient (model.Model.sized_loss), so a
+            # hint curve would score untrained heads against the very
+            # per-sample lengths the regime forbids; the wide curves are
+            # Part D's read instead -- does the answer settle at the
+            # sized depth, on the split the claim is made on.
+            "hints": {} if budget.depth_rule == "sized" else {
+                "val": hint_curve(model, batches["val"]),
+                "ood": hint_curve(model, batches["test"])},
             "compile_cache": {"training": record.get("compile_cache"),
                               "scoring": model.map.cache_stats()},
         }
+        if budget.depth_rule == "sized":
+            row["residual_curve"]["wide"] = residual_curve(
+                model, batches["wide"], deepest)
+            row["churn"]["wide"] = churn_curve(
+                model, batches["wide"], deepest)
         rows.append(row)
         log(f"  {algorithm}/seed{seed}:"
             f"  id {row['in_distribution']['score']:.4f}"
@@ -1904,6 +1917,10 @@ def main(argv=None) -> int:
                              "time; part of the tag")
     parser.add_argument("--probe", action="store_true",
                         help="fit the hint heads on a detached state")
+    parser.add_argument("--depth-rule", dest="depth_rule",
+                        choices=DEPTH_RULES, default=None,
+                        help="how every run decides its depth; part of "
+                             "the tag, see train.py")
     parser.add_argument("--solver", choices=sorted(SOLVERS), default=None,
                         help="the execution policy")
     parser.add_argument("--backward", choices=("full", "last"), default=None,
@@ -1920,7 +1937,7 @@ def main(argv=None) -> int:
                 "hint_weight", "pointer", "pos", "settle",
                 "solver", "backward", "n_train", "feedback", "forcing",
                 "eval_every", "selection", "segment_steps",
-                "segment_optim", "segment_detach"):
+                "segment_optim", "segment_detach", "depth_rule"):
         if getattr(arguments, key) is not None:
             budget = replace(budget, **{key: getattr(arguments, key)})
     for key in ("mixed", "probe", "dense", "trm"):
@@ -1928,6 +1945,12 @@ def main(argv=None) -> int:
             budget = replace(budget, **{key: True})
     if arguments.node_only:
         budget = replace(budget, edge_state=False, widths="paired")
+    if budget.depth_rule == "sized":
+        # the sweep factors multiply the sized depth (model.Model.
+        # rounds_for reads steps_of, which is the size rule here), and
+        # config.SIZED_SWEEP is Part D's ladder; sweep is not part of
+        # the tag, so nothing files differently.
+        budget = replace(budget, sweep=SIZED_SWEEP)
     if budget.dense:
         for algorithm in arguments.algorithms:
             dataset.densify(algorithm)

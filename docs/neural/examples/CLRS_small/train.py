@@ -44,8 +44,8 @@ import torch
 import dataset
 import model as zoo
 from config import (
-    ALGORITHMS, ARTIFACTS, FULL, GRAD_CLIP, H2_ARMS, MIXED, QUICK, REGIME,
-    SELECTION, SETTLE, WIDTHS, Budget, Widths)
+    ALGORITHMS, ARTIFACTS, DEPTH_RULES, FULL, GRAD_CLIP, H2_ARMS, MIXED,
+    QUICK, REGIME, SELECTION, SETTLE, WIDTHS, Budget, Widths)
 from dataset import POS
 from discopy.neural.cells import POOL
 from model import Batches, POINTERS, SOLVERS
@@ -143,6 +143,13 @@ def segment_loss(model, batch, every, start):
     steps the segment covers, under the model's own supervision regime
     (detached from the interaction when ``probe``).
 
+    The output half never reads ``batch.lengths``: every sample is
+    scored against its final answer at every segment end, whatever its
+    own trajectory did.  The hint half is indexed by the trajectory
+    clock, so under ``depth_rule="sized"`` -- arm D of ``PART_D.md``,
+    whose runs may not read the per-sample step counts at all -- it is
+    skipped and the loss is the deep output supervision alone.
+
     Parameters:
         model : The model being trained.
         batch : The batch being run.
@@ -160,14 +167,15 @@ def segment_loss(model, batch, every, start):
         term = model.decoders[name].loss(
             prediction[name], batch.outputs[name])
         output, each[name] = output + term, each.get(name, 0.0) + term
-    for step, found in enumerate(every, start=start):
-        targets = model.hint_targets(batch, step)
-        decoded = model.decode(
-            batch, found.detach() if model.probe else found,
-            names=list(targets)) if targets else {}
-        for name, (truth, alive) in targets.items():
-            term = model.decoders[name].loss(decoded[name][alive], truth)
-            hint, each[name] = hint + term, each.get(name, 0.0) + term
+    if model.depth_rule != "sized":
+        for step, found in enumerate(every, start=start):
+            targets = model.hint_targets(batch, step)
+            decoded = model.decode(
+                batch, found.detach() if model.probe else found,
+                names=list(targets)) if targets else {}
+            for name, (truth, alive) in targets.items():
+                term = model.decoders[name].loss(decoded[name][alive], truth)
+                hint, each[name] = hint + term, each.get(name, 0.0) + term
     hint = hint / len(every)
     return output + model.hint_weight * hint, {
         "output": zoo._number(output), "hint": zoo._number(hint),
@@ -305,6 +313,8 @@ def steps_of(budget: Budget) -> int:
 
 def depth_policy(budget: Budget) -> str:
     """ How a run chose its depth, for the artefact to record. """
+    if budget.depth_rule == "sized":
+        return "sized"
     return "trajectory" if budget.rounds is None else f"fixed:{budget.rounds}"
 
 
@@ -388,6 +398,7 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
                       feedback=budget.feedback, forcing=budget.forcing,
                       trm=budget.trm,
                       solver=budget.solver, backward=budget.backward,
+                      depth_rule=budget.depth_rule,
                       cache=4 + 2 * (1000 // max(budget.batch_size, 1)))
     if reuse and path.exists():
         stored = zoo.load_checkpoint(model, path)
@@ -486,6 +497,7 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
         "trm": budget.trm, "segment_steps": budget.segment_steps,
         "segment_optim": budget.segment_optim,
         "segment_detach": budget.segment_detach,
+        "depth_rule": budget.depth_rule,
     }
     torch.save(record, path)
     log(f"  {algorithm}/seed{seed}: best val {best['score']:.4f} at epoch "
@@ -575,6 +587,13 @@ def main(argv=None) -> int:
                              "whole run and only the supervision placement "
                              "changes (tag 'nodetach'); needs "
                              "--segment-optim per_batch")
+    parser.add_argument("--depth-rule", dest="depth_rule",
+                        choices=DEPTH_RULES, default=None,
+                        help="how every run decides its depth: "
+                             "'trajectory' reads the sample's own step "
+                             "count, 'sized' the length-free "
+                             "2n-steps size rule of PART_D.md "
+                             "(tag 'szd')")
     parser.add_argument("--solver", choices=sorted(SOLVERS),
                         default=None, help="the execution policy")
     parser.add_argument("--backward", choices=("full", "last"), default=None,
@@ -599,7 +618,7 @@ def main(argv=None) -> int:
                 "hint_weight", "pointer", "pos", "settle",
                 "solver", "backward", "n_train", "feedback", "forcing",
                 "eval_every", "selection", "segment_steps",
-                "segment_optim", "segment_detach"):
+                "segment_optim", "segment_detach", "depth_rule"):
         if getattr(arguments, key) is not None:
             budget = replace(budget, **{key: getattr(arguments, key)})
     for key in ("mixed", "probe", "dense", "trm"):

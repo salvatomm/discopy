@@ -73,7 +73,7 @@ from discopy.neural import (
     from_incidence)
 from discopy.neural.core import box_ports
 
-from config import HINT_WEIGHT, POOL, WIDTHS, Widths, holding
+from config import DEPTH_RULES, HINT_WEIGHT, POOL, WIDTHS, Widths, holding
 from dataset import (
     CLASSES, DENSE, DIRECTED, MASKED, SPECS, Split, complete, edge_features,
     kind, probes)
@@ -106,6 +106,14 @@ GSTATE = Ty("gstate")
 #: The rounds of message passing one step of the imitated algorithm costs:
 #: a node reaches a node through a box, so a hop is two rounds.
 HOPS = 2
+
+#: The size rule's constant: a *sized* run is ``SIZED * n`` algorithm
+#: steps where ``n`` is the batch's node count, at training and at
+#: evaluation alike -- ``2 * 16 = 32`` steps trained at ``n = 16``,
+#: ``2 * 64 = 128`` evaluated at ``n = 64``.  A worst-case bound in the
+#: size is algorithm knowledge; ``batch.lengths`` is per-sample leakage,
+#: and a sized run never reads it.  See :attr:`config.Budget.depth_rule`.
+SIZED = 2
 
 
 class Grounded(FixedPoint):
@@ -1541,6 +1549,14 @@ class Model(torch.nn.Module):
                 so that it fits the hint decoders and never the
                 interaction: Part 3's output-only arms; see
                 :meth:`Model.loss`.
+        depth_rule : How a run decides its depth, a member of
+                     :data:`config.DEPTH_RULES`.  ``"trajectory"`` reads
+                     ``batch.steps`` -- or :attr:`steps` when Part 1's
+                     fixed depth pinned one -- and ``"sized"`` reads
+                     ``SIZED * batch.size`` and nothing else: no sized
+                     run's depth, loss or evaluation may depend on
+                     ``batch.lengths``; see :meth:`Model.sized_loss` and
+                     :attr:`config.Budget.depth_rule`.
     """
     def __init__(self, algorithm: str, interpretation: MapNN,
                  encoders: torch.nn.ModuleDict,
@@ -1549,8 +1565,11 @@ class Model(torch.nn.Module):
                  settle: str = None, probe: bool = False,
                  feedback: str = None, forcing: float = 0.5,
                  feedback_encoders: torch.nn.ModuleDict = None,
-                 halt: HaltHead = None):
+                 halt: HaltHead = None, depth_rule: str = "trajectory"):
         super().__init__()
+        if depth_rule not in DEPTH_RULES:
+            raise ValueError(
+                f"{depth_rule!r} is not one of {DEPTH_RULES}")
         self.algorithm = algorithm
         self.map = interpretation
         self.encoders = encoders
@@ -1559,6 +1578,7 @@ class Model(torch.nn.Module):
         self.hint_weight = hint_weight
         self.settle = holding(settle)
         self.probe = probe
+        self.depth_rule = depth_rule
         self.feedback, self.forcing = feedback, forcing
         self.feedback_encoders = feedback_encoders
         self.halt = halt
@@ -1569,7 +1589,13 @@ class Model(torch.nn.Module):
     # --- what the model needs to know about the map ------------------------
 
     def steps_of(self, batch: Batch) -> int:
-        """ The algorithm steps a run on this batch covers. """
+        """
+        The algorithm steps a run on this batch covers: the size rule's
+        ``SIZED * batch.size`` under ``depth_rule="sized"``, otherwise
+        the trajectory's own -- or Part 1's fixed :attr:`steps`.
+        """
+        if self.depth_rule == "sized":
+            return SIZED * batch.size
         return batch.steps if self.steps is None else self.steps
 
     def rounds_for(self, batch: Batch, factor: float = 1.0) -> int:
@@ -1931,11 +1957,51 @@ class Model(torch.nn.Module):
         return {name: (batch.hints[name][index][alive], alive)
                 for name in probes(self.algorithm, "hint")}
 
+    def sized_loss(self, batch: Batch, state=None, **overrides):
+        """
+        The length-free loss of one non-segmented sized run: the output
+        loss on **all** samples at the **final** checkpoint, and nothing
+        else -- F-sized's supervision (``PART_D.md``).
+
+        :meth:`loss` supervises the output from each sample's own
+        termination onwards and the hints on the steps its trajectory
+        defines, and both reads are indexed by ``batch.lengths`` -- the
+        per-sample step counts a sized run exists to not know.  Here the
+        run is :meth:`rounds_for`'s sized depth, the loss reads the final
+        state alone, and no term touches ``batch.lengths`` or
+        ``batch.hints``; the hint decoders therefore receive no gradient
+        and their curves are not read for sized arms.
+
+        Parameters:
+            batch : The batch to run.
+            state : The flat initial messages, built here by default.
+            overrides : Test-time compute, i.e. ``rounds``.
+
+        Returns:
+            The loss, and its parts in :meth:`loss`'s shape, with
+            ``hint`` identically zero.
+        """
+        found = self.run(batch, state, **overrides)[-1]
+        names = probes(self.algorithm, "output")
+        prediction = self.decode(batch, found, names=names)
+        output, each = 0.0, {}
+        for name in names:
+            term = self.decoders[name].loss(
+                prediction[name], batch.outputs[name])
+            output, each[name] = output + term, each.get(name, 0.0) + term
+        return output, {"output": _number(output), "hint": 0.0,
+                        **{f"probe/{name}": _number(term)
+                           for name, term in each.items()}}
+
     def loss(self, batch: Batch, state=None, **overrides):
         """
         The supervised loss of one run: the output loss on every checkpoint
         from the trajectory's last step onwards, plus the hint loss on
         every step the trajectory defines.
+
+        Under ``depth_rule="sized"`` both of those reads are per-sample
+        step-count information, so the loss is :meth:`sized_loss` instead
+        and nothing below runs; the trajectory path is untouched.
 
         Supervising the output *from the end of the trajectory onwards*
         rather than at the last round alone is the protocol choice that
@@ -1982,6 +2048,8 @@ class Model(torch.nn.Module):
             The loss, and its parts: ``output``, ``hint`` and one
             ``probe/<name>`` per decoded probe.
         """
+        if self.depth_rule == "sized":
+            return self.sized_loss(batch, state, **overrides)
         every = self.run(batch, state, deep=True, **overrides)
         settled = (batch.lengths - 1).clamp(max=len(every) - 1)
         output, hint, halt, each = 0.0, 0.0, 0.0, {}
@@ -2116,7 +2184,8 @@ def build(algorithm: str, widths: Widths = None, steps: int = None,
           settle: str = None, pointer: str = "bilinear",
           solver: str = "iterate", backward: str = "full",
           probe: bool = False, feedback: str = None,
-          forcing: float = 0.5, trm: bool = False) -> Model:
+          forcing: float = 0.5, trm: bool = False,
+          depth_rule: str = "trajectory") -> Model:
     """
     The message-passing model: a diagram per batch, one shared cell per
     generator name, one encoder per input and one decoder per probe.
@@ -2159,6 +2228,9 @@ def build(algorithm: str, widths: Widths = None, steps: int = None,
               a detached soft-minimum :class:`~discopy.neural.solver.
               HaltHead` over the node states, and with it the
               segment-detached rollout of :meth:`Model.run`.
+        depth_rule : How a run decides its depth, a member of
+                     :data:`config.DEPTH_RULES`; see :meth:`Model.
+                     steps_of` and :meth:`Model.sized_loss`.
 
     Example
     -------
@@ -2208,7 +2280,8 @@ def build(algorithm: str, widths: Widths = None, steps: int = None,
         encoders, decoders, steps=steps, hint_weight=hint_weight,
         settle=settle, probe=probe, feedback=feedback, forcing=forcing,
         feedback_encoders=feedback_encoders,
-        halt=HaltHead(widths.state_dim, "softmin") if trm else None)
+        halt=HaltHead(widths.state_dim, "softmin") if trm else None,
+        depth_rule=depth_rule)
 
 
 def fit_cache(model, *batches) -> int:
