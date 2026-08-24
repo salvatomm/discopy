@@ -341,6 +341,39 @@ def from_wiring(cls, boxes: tuple, wires) -> "CMap":
     return cls(cls.ob(), cls.ob(), boxes, edges)
 
 
+_PERM_GATHER = None
+
+
+def _perm_gather(tensor, perm, inverse):
+    """
+    ``tensor[:, perm]`` for a permutation ``perm`` given with its
+    ``inverse``, differentiated as the gather ``grad[:, inverse]``.
+
+    Autograd differentiates advanced indexing with a generic atomic
+    scatter-add, which on a permutation does no summing at all yet costs
+    twenty times the gather it inverts; the gradient of gathering by a
+    bijection is the gather by its inverse, so the values and gradients
+    are bitwise those of ``tensor[:, perm]``.
+    """
+    global _PERM_GATHER
+    if _PERM_GATHER is None:
+        import torch
+
+        class PermGather(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, tensor, perm, inverse):
+                ctx.save_for_backward(inverse)
+                return tensor[:, perm]
+
+            @staticmethod
+            def backward(ctx, grad):
+                inverse, = ctx.saved_tensors
+                return grad[:, inverse], None, None
+
+        _PERM_GATHER = PermGather
+    return _PERM_GATHER.apply(tensor, perm, inverse)
+
+
 class CMap(compact.CMap):
     """
     A neural combinatorial map is a compact map with networks as boxes,
@@ -622,6 +655,8 @@ class CMap(compact.CMap):
         * ``inverse`` : the inverse permutation, back to port order,
         * ``perm`` : one round of routing in box order, the wire involution
           conjugated by the change of layout, ``inverse . src . layout``,
+        * ``perm_inverse`` : the inverse of ``perm``, which the backward
+          pass gathers by (see :func:`_perm_gather`),
         * ``metas`` : per group, its module, box indices and block shape.
 
         In this layout every module reads its inputs as a contiguous view
@@ -637,9 +672,10 @@ class CMap(compact.CMap):
         assert len(layout) == routing["total"], "the map is not closed"
         inverse = torch.empty_like(layout)
         inverse[layout] = torch.arange(len(layout))
+        perm = inverse[routing["src"][layout]]
         return {
             "layout": layout, "inverse": inverse,
-            "perm": inverse[routing["src"][layout]],
+            "perm": perm, "perm_inverse": torch.argsort(perm),
             "metas": tuple(
                 (module, indices, gather.shape[0], gather.shape[1])
                 for module, indices, gather in routing["groups"])}
@@ -664,6 +700,7 @@ class CMap(compact.CMap):
                     layout=fused["layout"].to(device),
                     inverse=fused["inverse"].to(device),
                     perm=fused["perm"].to(device),
+                    perm_inverse=fused["perm_inverse"].to(device),
                     metas=fused["metas"])
             cache[device] = entry
         return cache[device]
@@ -703,6 +740,29 @@ class CMap(compact.CMap):
         self.__dict__.pop("_runner_cache", None)
         return self
 
+    def compile_fused(self, fused: bool = True) -> CMap:
+        """
+        Run the round step of a closed map through the fused Triton
+        kernels of :mod:`discopy.neural.fused` -- one launch per shared
+        module, the routing folded into their stores and no intermediate
+        in memory -- when the map is one :class:`~discopy.neural.Site` and
+        one :class:`~discopy.neural.Relation` of the shapes they serve, see
+        :func:`~discopy.neural.fused.geometry`; any other map keeps the
+        reference step.  Off by default: the fused round agrees with the
+        reference to rounding error rather than bitwise, and it is an eager
+        :class:`torch.autograd.Function`, so this undoes :meth:`compile`
+        and should be called after it.
+
+        Parameters:
+            fused : Whether to use the fused kernels.
+        """
+        self._fused = fused
+        self._step_compile = None
+        for cache in ("_step_body_cache", "_step_cache",
+                      "_step_flat_cache", "_runner_cache"):
+            self.__dict__.pop(cache, None)
+        return self
+
     def _step_body(self, device):
         """
         One round of message passing as a single function of flat tensors,
@@ -717,6 +777,11 @@ class CMap(compact.CMap):
             routing = self._device_routing(device)
             if "perm" in routing:
                 perm, metas = routing["perm"], routing["metas"]
+                perm_inverse = routing["perm_inverse"]
+                fused = None
+                if getattr(self, "_fused", False):
+                    from discopy.neural.fused import step_of
+                    fused = step_of(self, routing)
 
                 def step(incoming, source, init):
                     chunks, group_outputs, offset = [], [], 0
@@ -729,10 +794,12 @@ class CMap(compact.CMap):
                             outputs.reshape(-1, n_boxes, width))
                         chunks.append(outputs.reshape(-1, block))
                         offset += block
-                    incoming = torch.cat(chunks, dim=-1)[:, perm]
+                    incoming = _perm_gather(
+                        torch.cat(chunks, dim=-1), perm, perm_inverse)
                     if init is not None:
                         incoming = incoming + init
                     return incoming, group_outputs
+                step = fused or step
             else:
                 src, groups = routing["src"], routing["groups"]
 
@@ -786,11 +853,13 @@ class CMap(compact.CMap):
         cache = self.__dict__.setdefault("_step_flat_cache", {})
         if device not in cache:
             body = self._step_body(device)
-            inverse = self._device_routing(device)["inverse"]
+            routing = self._device_routing(device)
+            inverse, layout = routing["inverse"], routing["layout"]
 
             def step(incoming, init):
                 incoming, group_outputs = body(incoming, None, init)
-                return incoming, incoming[:, inverse], group_outputs
+                return (incoming, _perm_gather(incoming, inverse, layout),
+                        group_outputs)
 
             cache[device] = self._compiled(step)
         return cache[device]
@@ -874,7 +943,9 @@ class CMap(compact.CMap):
         if fused:
             source = None
             incoming = torch.zeros(batch_size, routing["total"], **kwargs)\
-                if init is None else init[:, device_routing["layout"]]
+                if init is None else _perm_gather(
+                    init, device_routing["layout"],
+                    device_routing["inverse"])
             injected = incoming if (inject and init is not None) else None
         else:
             src = device_routing["src"]
@@ -889,8 +960,9 @@ class CMap(compact.CMap):
 
         def read(incoming, group_outputs):
             if return_flat:
-                return incoming[:, device_routing["inverse"]] if fused \
-                    else incoming
+                return _perm_gather(
+                    incoming, device_routing["inverse"],
+                    device_routing["layout"]) if fused else incoming
             if closed:
                 box_outputs = [None] * len(self.boxes)
                 for (_, indices, _), outputs in zip(groups, group_outputs):

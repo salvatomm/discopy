@@ -381,6 +381,83 @@ Changes since [`1.2.2`](https://github.com/discopy/discopy/releases/tag/1.2.2).
 
 ### Performance
 
+- `discopy.neural.fused`, one round of message passing of a
+  site-and-relation map as fused Triton kernels with a hand-written
+  backward, behind `CMap.compile_fused()` and `examples/sudoku`'s
+  `lattice_train.py --fused`, off by default.  The cell -- encoder,
+  mean pooling, `GRUCell`, `LayerNorm`, emission and the echoes of its
+  traced roles -- is one kernel and the unit -- `phi`, sum pooling, `rho`
+  -- another; both write their outputs straight to the ports the wires
+  carry them to, so the round's permutation costs nothing, and the
+  forward keeps only the gates and normalisation statistics for the
+  backward, which recomputes the rest.  The backward is four kernels plus
+  the cell's weight gradients as seven GEMMs over the batch on what the
+  kernels kept.  A hidden width of 68 is held as 64 + 16 tiles; dots
+  follow `torch.get_float32_matmul_precision` (TF32 unless `"highest"`)
+  and float64 is exact, which `test/neural/test_fused.py` pins with
+  `gradcheck`, every gradient against the reference step at batch 1, 7
+  and 512, and five trainer iterations fused on and off.  Any other map,
+  or widths whose padded tiles exceed 128, keeps the reference step.
+  Measured on the 32k-parameter lattice model on an H100 at batch 1024,
+  minimum over 40 timed rounds: forward 0.35 ms and backward 1.50 ms per
+  round against 1.7 and 3.0 ms for the eager reference, i.e. 1.85 ms
+  against the ~3.9 ms per round of the compiled `--fast --compile-step`
+  step.  A whole training step at batch 1024 and 14 cycles, timed with
+  four other jobs on the GPU (`docs/neural/artifacts/scripts/
+  bench_fused.py`, best of 20): 184 ms fused against 245 ms
+  `--fast --compile-step` and 327 ms default (1.3x and 1.8x; means 206,
+  283 and 410 ms), and 2,391 kernel launches per step against 3,889 and
+  5,254 -- short of the 5x the fused round was meant to buy.  The
+  kernels are register-bound: on Hopper a 64-by-64 float32 tile costs 32
+  registers per thread of a four-warp program and Triton hoists every
+  load to the top of straight-line code, so each kernel sits at the
+  255-register cap with spills; eight warps on 64 rows faults inside
+  Triton's `wgmma` lowering, TMA-loaded weight tiles took no register
+  pressure off and cost a shared-memory buffer per load, and a single
+  backward kernel needed twice the SM's shared memory.  Over 500 training
+  steps from one seed the fused run's loss stays within the spread the
+  baseline shows between TF32 and full precision (0.44 against 0.37 and
+  0.45 at step 500; 0.55, 0.54 and 0.57 over the run).
+- `neural.CMap`'s permutations differentiate as gathers by the inverse
+  permutation (`_perm_gather`) rather than autograd's generic atomic
+  scatter-add, which burned 63% of a recursion training step's GPU time
+  on an H100 at 1/24th of the speed of the gather it inverts. Values and
+  gradients are bitwise unchanged -- the routing indices are bijections
+  -- and `test_general.py` says so; measured end-to-end on
+  `examples/sudoku`'s lattice model: 2.4x at 64k parameters (200 to
+  84 ms/step at batch 512), 3.3x at 1M (770 to 231 ms/step).
+- `neural.cells.Cell.layout`, the per-width `Layout` of plain slices and
+  role indices that `Site`, `Relation` and `Cyclic` now read in `forward`
+  in place of `places` and its `Ty`-keyed dict.  `self.orbit[0]` built a
+  `Ty` inside every call, Dynamo cannot trace that, and a graph break
+  inside the loop over a round's modules makes it skip the whole frame:
+  `compile_rounds` had been compiling nothing for these cells -- no
+  fusion, no CUDA graph -- which is why "compiled" had always measured
+  eager.  The layout is computed once per width (at construction for the
+  signature's own width), the tensor ops are the same in the same order,
+  so every result is bitwise unchanged (`test_equivalence.py`'s golden
+  gate, and `test_general.py` now pins that both cells trace as one
+  graph).  With the round finally compiled, a training step of
+  `examples/sudoku`'s 32k-parameter lattice model on an H100 goes from
+  101 to 66 ms at batch 512 and from 162 to 110 ms at batch 1024 (1.5x),
+  its kernel launches from ~6,200 to ~4,200.
+- `examples/sudoku`'s lattice trainer has a sync-free step
+  (`lattice_train.py --fast`): the deep-supervision loss is one batched,
+  branch-free pass over the stacked readouts (`lattice.losses_deep`), the
+  projection's decision is drawn at a fixed shape for every row and
+  written where it applies (`lattice.decide`) rather than on the rows a
+  `nonzero` reads back, the log-line diagnostics are computed on log
+  steps only, and the pool's three discard counters travel in one host
+  read -- 85 device-to-host syncs per step down to 2.  `--compile-step`
+  compiles that loss as one graph beside the rounds `compile_rounds`
+  already compiles; compiling the whole unrolled recursion instead was
+  tried and abandoned (a quarter of an hour of tracing without an end).
+  `Lattice.run` / `Net.run` expose the recursion and heads without the
+  projection for it.  Measured on the 32k-parameter model on an H100:
+  1.7x per step with two trials sharing the GPU (the search's setting),
+  10% with the GPU to itself, where the step is bound by the ~6,400
+  small kernels it launches rather than by the host.  The default path
+  is the reference loop, bitwise.
 - `neural.CMap.port_widths` is a `cached_property`, like `module_list`
   beside it: it is a function of the boxes, which a map fixes in its
   constructor, and `CMap.forward` reads it on every call. One call is one
