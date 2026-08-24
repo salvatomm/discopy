@@ -44,8 +44,8 @@ import torch
 import dataset
 import model as zoo
 from config import (
-    ALGORITHMS, ARTIFACTS, DEPTH_RULES, FULL, GRAD_CLIP, H2_ARMS, MIXED,
-    QUICK, REGIME, SELECTION, SETTLE, WIDTHS, Budget, Widths)
+    ALGORITHMS, ARTIFACTS, DATA, DEAR_SIZES, DEPTH_RULES, FULL, GRAD_CLIP,
+    H2_ARMS, MIXED, QUICK, REGIME, SELECTION, SETTLE, WIDTHS, Budget, Widths)
 from dataset import POS
 from discopy.neural.cells import POOL
 from model import Batches, POINTERS, SOLVERS
@@ -386,6 +386,15 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
     Returns:
         The model and the record that was cached beside it.
     """
+    if budget.data == "dear" and budget.depth_rule != "sized":
+        # a DEAR cache stores no step counts, so `read` fills
+        # `Split.lengths` with a placeholder that only a length-blind
+        # regime may run over; the trajectory rule would silently train
+        # one step deep.
+        raise ValueError(
+            f"data='dear' requires depth_rule='sized', not "
+            f"{budget.depth_rule!r}: the cache is output-only and holds "
+            f"no per-sample step counts")
     widths = widths or WIDTHS[budget.widths]
     device = default_device() if device is None else device
     path = artifact_of(algorithm, budget, seed)
@@ -411,7 +420,7 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
         log(f"  {algorithm}/seed{seed}: loaded {path.name}")
         return model.to(device), stored
 
-    splits = splits or dataset.load_all(algorithm)
+    splits = splits or dataset.load_for(algorithm, budget.data)
     if budget.pos != "sampler":
         # `uniform` re-parameterizes an input without losing information,
         # so it applies to every split as the reference's randomised
@@ -420,10 +429,15 @@ def train_model(algorithm: str, budget: Budget = FULL, seed: int = 0,
         splits = {name: one.repositioned(budget.pos, seed)
                   if budget.pos == "uniform" or name.startswith("train")
                   else one for name, one in splits.items()}
+    # DEAR training data is per-size by construction (a batch is one
+    # compiled diagram, homogeneous in n), so it takes the mixed-size
+    # path over its own sizes whatever `budget.mixed` says.
+    sizes = DEAR_SIZES if budget.data == "dear" else MIXED
     train = Batches.over(
         [splits[f"train{size}"].subsample(
-            budget.n_train and budget.n_train // len(MIXED))
-         for size in MIXED], budget.batch_size, device) if budget.mixed \
+            budget.n_train and budget.n_train // len(sizes))
+         for size in sizes], budget.batch_size, device) \
+        if budget.mixed or budget.data == "dear" \
         else Batches(splits["train"].subsample(budget.n_train),
                      budget.batch_size, device)
     valid = Batches(splits["val"], budget.eval_batch_size, device)
@@ -594,6 +608,11 @@ def main(argv=None) -> int:
                              "count, 'sized' the length-free "
                              "2n-steps size rule of PART_D.md "
                              "(tag 'szd')")
+    parser.add_argument("--data", choices=DATA, default=None,
+                        help="what to train on: 'clrs30' is the "
+                             "benchmark's splits, 'dear' is DEAR's "
+                             "protocol (config.DEAR, tag 'dear'); "
+                             "'dear' requires --depth-rule sized")
     parser.add_argument("--solver", choices=sorted(SOLVERS),
                         default=None, help="the execution policy")
     parser.add_argument("--backward", choices=("full", "last"), default=None,
@@ -618,7 +637,7 @@ def main(argv=None) -> int:
                 "hint_weight", "pointer", "pos", "settle",
                 "solver", "backward", "n_train", "feedback", "forcing",
                 "eval_every", "selection", "segment_steps",
-                "segment_optim", "segment_detach", "depth_rule"):
+                "segment_optim", "segment_detach", "depth_rule", "data"):
         if getattr(arguments, key) is not None:
             budget = replace(budget, **{key: getattr(arguments, key)})
     for key in ("mixed", "probe", "dense", "trm"):
@@ -634,7 +653,7 @@ def main(argv=None) -> int:
     for algorithm in arguments.algorithms:
         if budget.dense:
             dataset.densify(algorithm)
-        splits = dataset.load_all(algorithm)
+        splits = dataset.load_for(algorithm, budget.data)
         # a Part 3 arm reads its size regime per row and refuses a row
         # that has not declared one; the probe that *decides* the regime
         # says so on the command line; anything else keeps the budget's.

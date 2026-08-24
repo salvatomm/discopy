@@ -80,6 +80,53 @@ MIXED = (8, 10, 12, 14, 16)
 SPLITS = ("train", "val", "test", "wide") \
     + tuple(f"train{size}" for size in MIXED)
 
+#: Part F1's data protocol, transcribed from the DEAR repository
+#: (Georgiev, Buffelli, Wilson, Lio, *Deep Equilibrium Algorithmic
+#: Reasoning*, NeurIPS 2024, arXiv:2410.15059;
+#: ``github.com/HekpoMaH/DEAR``, ``datasets/clrs_datasets.py`` and
+#: ``prepare_datasets.py``): their dataset seed is 47
+#: (``hyperparameters.py``) and a split's generator seed is
+#: ``47 + 3 * num_nodes``, plus 1 for ``val`` and 2 for ``test``.  A
+#: *train* sample's size is drawn per sample as
+#: ``rng.randint(num_nodes // 2, num_nodes + 1)`` -- uniform on 8..16 at
+#: ``num_nodes = 16`` -- where ``rng`` is the split's own
+#: ``np.random.RandomState``; ``val`` and ``test`` are fixed at their
+#: ``num_nodes``.  Graphs are Erdos-Renyi with edge probability drawn
+#: uniformly from ``{0.1, ..., 0.9}`` (their ``p`` grid), and ``pos`` is
+#: randomised (sorted uniforms, rank kept) by ``clrs.process_random_pos``
+#: with the same ``rng``.  ``num_samples`` for train is the protocol's
+#: 10^5; their repository's ``datasets/_configs.py`` *defaults* to 10^4,
+#: which ``PART_F1.md`` records as a provenance caveat.
+DEAR_SEED = 47
+
+DEAR = {
+    "train": {"num_samples": 100_000, "num_nodes": 16,
+              "seed": DEAR_SEED + 3 * 16},
+    "val": {"num_samples": 100, "num_nodes": 16,
+            "seed": DEAR_SEED + 3 * 16 + 1},
+    "test": {"num_samples": 100, "num_nodes": 64,
+             "seed": DEAR_SEED + 3 * 64 + 2},
+}
+
+#: The sizes a DEAR training split's samples land on: every integer of
+#: 8..16, where :data:`MIXED` is the even ones.  A batch is one compiled
+#: diagram and must be homogeneous in ``n``, so the cache is one file per
+#: size and an epoch shuffles across them (:meth:`model.Batches.over`).
+DEAR_SIZES = tuple(range(8, 17))
+
+#: The splits a DEAR cache holds.  **Output-only**: the cache stores
+#: inputs and outputs alone -- no hint arrays (at 10^5 samples they are
+#: prohibitive, and no sized arm may read them), and no ``lengths``,
+#: which live in a sidecar file (:func:`dataset.dear_sidecar`) read once
+#: by the bound check and never by any training or evaluation path.
+DEAR_SPLITS = tuple(f"dear_train{size}" for size in DEAR_SIZES) \
+    + ("dear_val", "dear_test")
+
+#: What data a budget trains and evaluates on.  ``"clrs30"`` is
+#: :data:`CLRS30`, every number before Part F1; ``"dear"`` is
+#: :data:`DEAR`, tag component ``dear``.
+DATA = ("clrs30", "dear")
+
 #: The eight algorithms of ``project.md``.  Part 1 built the harness on
 #: the first three -- ``minimum`` is a non-graph sanity check that only the
 #: readout relation can solve, ``bfs`` is the canonical parallel wavefront
@@ -400,6 +447,16 @@ class Budget:
                      dropped; the arms are output-only regardless).  Tag
                      component ``szd``, appended only when non-default;
                      see ``PART_D.md``.
+        data : What the budget trains and evaluates on, a member of
+               :data:`DATA`.  ``"clrs30"`` is the benchmark's own splits,
+               the default and every number before Part F1; ``"dear"``
+               is DEAR's protocol (:data:`DEAR`): 10^5 training
+               trajectories at sizes 8..16, 100 validation at
+               ``n = 16``, 100 test at ``n = 64``, cached output-only.
+               A DEAR cache stores no per-sample step counts at all, so
+               it requires ``depth_rule="sized"``
+               (:func:`train.train_model` refuses anything else).  Tag
+               component ``dear``, appended only when non-default.
     """
     name: str
     epochs: int
@@ -433,6 +490,7 @@ class Budget:
     segment_optim: str = "per_segment"
     segment_detach: bool = True
     depth_rule: str = "trajectory"
+    data: str = "clrs30"
 
     @property
     def tag(self) -> str:
@@ -472,6 +530,9 @@ class Budget:
         'full-seg4-acc-szd'
         >>> replace(FULL, depth_rule="sized", solver="grounded").tag
         'full-szd-grounded'
+        >>> replace(FULL, depth_rule="sized", data="dear",
+        ...         lr=3e-4, eval_every=1).tag
+        'full-szd-dear-ev1'
         """
         parts = [self.name]
         if self.widths != "mpnn":
@@ -505,6 +566,8 @@ class Budget:
                 parts.append("nodetach")
         if self.depth_rule != "trajectory":
             parts.append("szd")
+        if self.data != "clrs30":
+            parts.append(self.data)
         if self.feedback:
             parts.append("closed" if self.feedback == "state"
                          else f"closed-{self.feedback}")
@@ -735,6 +798,22 @@ H2_CONTRASTS = {
     ("O", "F"): "differentiation policy -- unrolled against Jacobian-free",
 }
 
+# --- Part F1 ---------------------------------------------------------------
+#
+# The parity leg against DEAR's published Table 1 (arXiv:2410.15059):
+# `bellman_ford` at *their* protocol -- their data (:data:`DEAR`), their
+# lr 3e-4, their batch 32, their 100 epochs with best-val checkpoint
+# selection sampled every epoch -- under this study's two length-free
+# arms.  Widths stay ``mpnn`` (the recorded baseline; the parameter
+# count is printed beside their latent-128 description, not matched to
+# it).  Every gate of ``PART_F1.md`` is against their published numbers;
+# arm-vs-arm contrasts decide nothing here.
+
+#: What every F1 arm shares: DEAR's data and optimisation protocol under
+#: the sized depth rule -- the one regime an output-only cache can run.
+F1_PROTOCOL = {"data": "dear", "depth_rule": "sized", "lr": 3e-4,
+               "epochs": 100, "eval_every": 1, "weight_decay": 0.0}
+
 #: Where the per-row size regime is recorded once the probe has measured
 #: it.  A *file* rather than a literal in this module, because the regime
 #: is a measurement and not an opinion: the probe writes it, the campaign
@@ -770,3 +849,17 @@ if REGIME_FILE.exists():
     REGIME.update({
         name: found["regime"] for name, found
         in json.loads(REGIME_FILE.read_text())["rows"].items()})
+
+#: Part F1's two arms, by the name their tables print: **D** -- the
+#: proven arm of ``PART_D.md``, deep output supervision in detached
+#: segments of 4 accumulated to one optimizer step per batch -- and
+#: **F-sized** -- the one-step-gradient equilibrium baseline at the same
+#: sized depth, the parity diagnostic (their training family on our
+#: processor).  Both from :data:`H2_ARMS`'s O and F plus
+#: :data:`F1_PROTOCOL`, so each arm differs from its Part D self in the
+#: protocol fields alone.
+F1_ARMS = {
+    "D": replace(H2_OUTPUT_ONLY, segment_steps=4,
+                 segment_optim="per_batch", **F1_PROTOCOL),
+    "F-sized": replace(H2_FIXEDPOINT, **F1_PROTOCOL),
+}

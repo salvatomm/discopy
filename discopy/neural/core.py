@@ -740,13 +740,14 @@ class CMap(compact.CMap):
         self.__dict__.pop("_runner_cache", None)
         return self
 
-    def compile_fused(self, fused: bool = True) -> CMap:
+    def compile_fused(self, fused: bool = True,
+                      backend: str = "triton") -> CMap:
         """
-        Run the round step of a closed map through the fused Triton
-        kernels of :mod:`discopy.neural.fused` -- one launch per shared
-        module, the routing folded into their stores and no intermediate
-        in memory -- when the map is one :class:`~discopy.neural.Site` and
-        one :class:`~discopy.neural.Relation` of the shapes they serve, see
+        Run the round step of a closed map through the fused kernels of
+        :mod:`discopy.neural.fused` -- one launch per shared module, the
+        routing folded into their stores and no intermediate in memory --
+        when the map is one :class:`~discopy.neural.Site` and one
+        :class:`~discopy.neural.Relation` of the shapes they serve, see
         :func:`~discopy.neural.fused.geometry`; any other map keeps the
         reference step.  Off by default: the fused round agrees with the
         reference to rounding error rather than bitwise, and it is an eager
@@ -755,8 +756,11 @@ class CMap(compact.CMap):
 
         Parameters:
             fused : Whether to use the fused kernels.
+            backend : ``"triton"`` for the Triton kernels, ``"cuda"`` for
+                      the hand-written ones of
+                      :mod:`discopy.neural.fused_cuda`.
         """
-        self._fused = fused
+        self._fused, self._fused_backend = fused, backend
         self._step_compile = None
         for cache in ("_step_body_cache", "_step_cache",
                       "_step_flat_cache", "_runner_cache"):
@@ -781,7 +785,8 @@ class CMap(compact.CMap):
                 fused = None
                 if getattr(self, "_fused", False):
                     from discopy.neural.fused import step_of
-                    fused = step_of(self, routing)
+                    backend = getattr(self, "_fused_backend", "triton")
+                    fused = step_of(self, routing, backend)
 
                 def step(incoming, source, init):
                     chunks, group_outputs, offset = [], [], 0

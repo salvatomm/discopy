@@ -44,7 +44,7 @@ import dataset
 import model as zoo
 import train as training
 from config import (
-    ALGORITHMS, ANCHORS, ANCHOR_SOURCE, ARTIFACTS, DEPTH_RULES, FULL,
+    ALGORITHMS, ANCHORS, ANCHOR_SOURCE, ARTIFACTS, DATA, DEPTH_RULES, FULL,
     H2_ARMS, ORDER_DEPENDENT, ORDER_FREE, QUICK, SETTLE, SIZED_SWEEP,
     WIDTHS, Budget)
 from dataset import DIRECTED, POS, kind, probes
@@ -951,7 +951,7 @@ def report(algorithm: str, budget: Budget = FULL, seeds=None, device=None,
         log : Where to print progress.
     """
     device = training.default_device() if device is None else device
-    splits = dataset.load_all(algorithm)
+    splits = dataset.load_for(algorithm, budget.data)
     splits["wide"] = splits["wide"].subsample(budget.n_wide)
     batches = {name: zoo.Batches(splits[name], budget.eval_batch_size, device)
                for name in ("val", "test", "wide")}
@@ -1020,15 +1020,26 @@ def report(algorithm: str, budget: Budget = FULL, seeds=None, device=None,
         "types": {name: "/".join(kind(algorithm, name))
                   for stage in ("output", "hint")
                   for name in probes(algorithm, stage)},
-        "protocol": {"train": "n <= 16, CLRS-30 seeds", "val": "n = 16",
-                     "ood": "n = 64, 32 trajectories (canonical)",
-                     "ood_wide": f"n = 64, {len(splits['wide'])} trajectories",
-                     "depth": training.depth_policy(budget),
-                     "hops_per_step": zoo.HOPS},
+        "protocol": {
+            "train": "10^5 trajectories, n in 8..16, DEAR seeds"
+                     if budget.data == "dear" else "n <= 16, CLRS-30 seeds",
+            "val": "n = 16, 100 trajectories (DEAR)"
+                   if budget.data == "dear" else "n = 16",
+            "ood": "n = 64, 100 trajectories (DEAR's test split)"
+                   if budget.data == "dear"
+                   else "n = 64, 32 trajectories (canonical)",
+            "ood_wide": f"n = 64, {len(splits['wide'])} trajectories"
+                        + (" (CLRS-30 seed, secondary)"
+                           if budget.data == "dear" else ""),
+            "depth": training.depth_policy(budget),
+            "hops_per_step": zoo.HOPS},
         "anchors": ANCHORS[algorithm],
         "anchor_source": ANCHOR_SOURCE,
-        "settles": {"val": settling(batches["val"]),
-                    "ood": settling(batches["test"])},
+        # settling is read off a split's hints, which an output-only
+        # DEAR cache does not store.
+        "settles": {} if budget.data == "dear" else {
+            "val": settling(batches["val"]),
+            "ood": settling(batches["test"])},
         "budget": {"name": budget.name, "epochs": budget.epochs,
                    "batch_size": budget.batch_size, "lr": budget.lr,
                    "widths": budget.widths, "pool": budget.pool,
@@ -1921,6 +1932,9 @@ def main(argv=None) -> int:
                         choices=DEPTH_RULES, default=None,
                         help="how every run decides its depth; part of "
                              "the tag, see train.py")
+    parser.add_argument("--data", choices=DATA, default=None,
+                        help="what the models were trained on; part of "
+                             "the tag, see train.py")
     parser.add_argument("--solver", choices=sorted(SOLVERS), default=None,
                         help="the execution policy")
     parser.add_argument("--backward", choices=("full", "last"), default=None,
@@ -1937,7 +1951,7 @@ def main(argv=None) -> int:
                 "hint_weight", "pointer", "pos", "settle",
                 "solver", "backward", "n_train", "feedback", "forcing",
                 "eval_every", "selection", "segment_steps",
-                "segment_optim", "segment_detach", "depth_rule"):
+                "segment_optim", "segment_detach", "depth_rule", "data"):
         if getattr(arguments, key) is not None:
             budget = replace(budget, **{key: getattr(arguments, key)})
     for key in ("mixed", "probe", "dense", "trm"):

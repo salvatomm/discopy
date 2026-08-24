@@ -997,7 +997,8 @@ def _cell_grads(pool, gate, encode, geo) -> list:
             g_normed[:s], g_normed[s:], we[:, :s], we[:, s]]
 
 
-def fused_step(incoming, init, params: tuple, geo: Geometry, perm_inverse):
+def fused_step(incoming, init, params: tuple, geo: Geometry, perm_inverse,
+               backend: str = "triton"):
     """
     One fused round: the next round's incoming messages, in the box-order
     layout of :attr:`~discopy.neural.CMap._fused_routing`.
@@ -1008,7 +1009,15 @@ def fused_step(incoming, init, params: tuple, geo: Geometry, perm_inverse):
         params : The tensors of :func:`parameters`.
         geo : The :func:`geometry` of the map.
         perm_inverse : The inverse of the round's permutation, on device.
+        backend : ``"triton"`` for the kernels here, ``"cuda"`` for those
+                  of :mod:`discopy.neural.fused_cuda`.
     """
+    if backend == "cuda":
+        from discopy.neural import fused_cuda
+        return fused_cuda.fused_step(incoming, init, params, geo,
+                                     perm_inverse)
+    if backend != "triton":
+        raise ValueError(f"unknown fused backend {backend!r}")
     return FusedRound.apply(incoming, init, perm_inverse, geo,
                             precision(incoming), *params)
 
@@ -1044,7 +1053,7 @@ class Outputs:
             offset += block
 
 
-def step_of(cmap, routing: dict):
+def step_of(cmap, routing: dict, backend: str = "triton"):
     """
     The fused round step of a closed map, ``(incoming, source, init) ->
     (incoming, outputs)`` as :meth:`~discopy.neural.CMap._step_body`
@@ -1053,17 +1062,18 @@ def step_of(cmap, routing: dict):
     Parameters:
         cmap : The closed :class:`~discopy.neural.CMap`.
         routing : Its device routing.
+        backend : The kernels of :func:`fused_step`.
     """
     geo = geometry(cmap)
     if geo is None:
         return None
-    if tl is None:
+    if backend == "triton" and tl is None:
         raise ImportError("the fused round needs triton")
     site, relation = routing["metas"][0][0], routing["metas"][1][0]
     perm_inverse = routing["perm_inverse"]
 
     def step(incoming, source, init):
-        incoming = fused_step(
-            incoming, init, parameters(site, relation), geo, perm_inverse)
+        incoming = fused_step(incoming, init, parameters(site, relation),
+                              geo, perm_inverse, backend)
         return incoming, Outputs(incoming, init, routing)
     return step

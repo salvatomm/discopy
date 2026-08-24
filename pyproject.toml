@@ -7,6 +7,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["discopy*"]
 
+[tool.setuptools.package-data]
+"discopy.neural" = ["cuda/*.cu"]
+
 [project]
 name = "discopy"
 dynamic = ["version"]

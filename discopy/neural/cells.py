@@ -75,7 +75,7 @@ Summary
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Mapping
+from typing import NamedTuple, Mapping
 
 import torch
 
@@ -124,6 +124,14 @@ class Mode(StrEnum):
     CARRY = "carry"
 
 
+class Layout(NamedTuple):
+    """ What a cell reads and writes at one width, see :meth:`Cell.layout`. """
+    arity: int              #: of the first orbit
+    message: slice          #: the first orbit's block
+    traced: tuple           #: one slice per role of :meth:`Cell.roles`
+    emitted: tuple          #: per port after the first orbit, its role index
+
+
 class Cell(torch.nn.Module):
     """
     What the two cells share: a signature, the widths of its roles, and the
@@ -146,6 +154,7 @@ class Cell(torch.nn.Module):
         self.fixed = signature.width(self.widths) \
             - orbit.copies * orbit.arity * self.leg
         self._places: dict = {}
+        self._layouts: dict = {}
 
     def places(self, width: int) -> tuple[int, dict]:
         """
@@ -165,6 +174,29 @@ class Cell(torch.nn.Module):
             resized = self.signature.resize(self.orbit[0], arity)
             self._places[width] = (arity, resized.slices(self.widths))
         return self._places[width]
+
+    def layout(self, width: int) -> Layout:
+        """
+        :meth:`places` as plain slices and indices, cached per width: what
+        a forward pass reads at trace time, so that compiling it meets no
+        :class:`~discopy.frobenius.Ty`.  Subclasses compute it for the
+        width of their own signature at construction and lazily for any
+        other.
+
+        Parameters:
+            width : The width of the incoming flat message vector.
+        """
+        if width not in self._layouts:
+            arity, places = self.places(width)
+            roles = self.roles()
+            self._layouts[width] = Layout(
+                arity, places[self.orbit[0]],
+                tuple(places[role] for role in roles),
+                tuple(roles.index(atom)
+                      for orbit in self.signature.orbits[1:]
+                      for _ in range(orbit.copies * orbit.arity)
+                      for atom in orbit.role if self.widths[atom]))
+        return self._layouts[width]
 
     def roles(self, mode: Mode = None) -> tuple:
         """ The atomic roles of the orbits after the first, in order. """
@@ -240,6 +272,11 @@ class Site(Cell):
         self.states = self.roles(Mode.STATE)
         self.inputs = tuple(role for role in self.roles()
                             if self.mode[role] != Mode.STATE)
+        roles = self.roles()
+        self.state_index = tuple(roles.index(role) for role in self.states)
+        self.input_index = tuple(roles.index(role) for role in self.inputs)
+        self.echo = tuple(self.mode[role] == Mode.CARRY or resumable
+                          for role in self.inputs)
         if not self.states:
             raise ValueError("a site needs a state to carry")
         self.state_width = self.widths[self.states[0]]
@@ -255,17 +292,20 @@ class Site(Cell):
         self.emit = torch.nn.Linear(
             self.state_width + (self.leg if per_leg else 0), self.leg) \
             if emit else None
+        self.layout(signature.width(self.widths))
 
     def forward(self, x):
-        arity, places = self.places(x.shape[-1])
-        message = x[:, places[self.orbit[0]]].reshape(-1, arity, self.leg)
-        carried = [x[:, places[role]] for role in self.states]
-        given = {role: x[:, places[role]] for role in self.inputs}
+        layout = self.layout(x.shape[-1])
+        arity = layout.arity
+        message = x[:, layout.message].reshape(-1, arity, self.leg)
+        traced = [x[:, block] for block in layout.traced]
+        carried = [traced[index] for index in self.state_index]
+        given = [traced[index] for index in self.input_index]
 
         pooled = self.pooling(self.encode(torch.cat([
             carried[0].unsqueeze(1).expand(-1, arity, -1), message], -1)))
         updated = self.update(
-            torch.cat([pooled] + list(given.values()), -1),
+            torch.cat([pooled] + given, -1),
             carried[0] if len(carried) == 1 else tuple(carried))
         updated = [updated] if isinstance(updated, torch.Tensor) \
             else list(updated)
@@ -282,13 +322,13 @@ class Site(Cell):
                 self.emit(updated[0])
             belief = signal.unsqueeze(1).expand(-1, arity, -1).reshape(
                 -1, arity * self.leg)
-        emitted = dict(zip(self.states, updated))
-        for role, value in given.items():
-            emitted[role] = value if (
-                self.mode[role] == Mode.CARRY or self.resumable) \
-                else torch.zeros_like(value)
-        out = torch.cat([belief] + _emissions(
-            self.signature, self.widths, emitted), -1)
+        emitted = list(traced)
+        for index, value in zip(self.state_index, updated):
+            emitted[index] = value
+        for index, value, echo in zip(self.input_index, given, self.echo):
+            emitted[index] = value if echo else torch.zeros_like(value)
+        out = torch.cat(
+            [belief] + [emitted[index] for index in layout.emitted], -1)
         assert out.shape == x.shape, "the cell changed its port widths"
         return out
 
@@ -336,9 +376,10 @@ class Relation(Cell):
         self.rho = torch.nn.Sequential(
             torch.nn.Linear(self.leg + hidden, hidden), torch.nn.ReLU(),
             torch.nn.Linear(hidden, self.leg))
+        self.layout(signature.width(self.widths))
 
     def forward(self, x):
-        arity, _ = self.places(x.shape[-1])
+        arity = self.layout(x.shape[-1]).arity
         message = x.reshape(-1, arity, self.leg)
         pooled = self.pooling(self.phi(message)).unsqueeze(1).expand(
             -1, arity, -1)
@@ -439,9 +480,10 @@ class Cyclic(Cell):
         self.register_buffer(
             "roll", (offsets.unsqueeze(1) + offsets) % self.arity,
             persistent=False)
+        self.layout(signature.width(self.widths))
 
     def forward(self, x):
-        arity, _ = self.places(x.shape[-1])
+        arity = self.layout(x.shape[-1]).arity
         if arity != self.arity:
             raise ValueError(
                 f"a Cyclic cell is arity-fixed: built at {self.arity}, "
@@ -461,14 +503,3 @@ def _mlp(dom: int, hidden: int, depth: int) -> torch.nn.Sequential:
             layers.append(torch.nn.ReLU())
         layers.append(torch.nn.Linear(hidden if index else dom, hidden))
     return torch.nn.Sequential(*layers)
-
-
-def _emissions(signature: Signature, widths: Mapping, values: Mapping) -> list:
-    """
-    What a site writes on the orbits after the first, in port order: each
-    surviving role once per copy of its leg.
-    """
-    return [values[atom]
-            for orbit in signature.orbits[1:]
-            for _ in range(orbit.copies * orbit.arity)
-            for atom in orbit.role if widths[atom]]

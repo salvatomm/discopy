@@ -432,3 +432,46 @@ def test_act_reads_the_trace_it_halts_on():
     assert float(model.solver.halt.loss(halt, correct)) > 0.0
     with pytest.raises(ValueError, match="trace to halt on"):
         ACT(1, 2, 2, halt=HaltHead(2))
+
+
+def test_perm_gather_backward_is_inverse_gather():
+    """The fused round's permutation differentiates as the inverse
+    gather, bitwise equal to autograd's scatter-add of ``x[:, perm]``."""
+    from discopy.neural.core import _perm_gather
+    generator = torch.Generator().manual_seed(0)
+    perm = torch.randperm(257, generator=generator)
+    inverse = torch.argsort(perm)
+    x = torch.randn(5, 257, generator=generator, dtype=torch.float64,
+                    requires_grad=True)
+    grad = torch.randn(5, 257, generator=generator, dtype=torch.float64)
+    x[:, perm].backward(grad)
+    reference, x.grad = x.grad, None
+    found = _perm_gather(x, perm, inverse)
+    found.backward(grad)
+    assert torch.equal(found, x[:, perm])
+    assert torch.equal(x.grad, reference)
+
+
+def test_cells_trace_without_graph_breaks():
+    """
+    A cell's forward meets no ``Ty`` at trace time: the site and the
+    relation each compile as one graph, and the traced forward is the
+    eager one bitwise.  Before ``Cell.layout``, ``self.orbit[0]`` built a
+    ``Ty`` inside every call and Dynamo fell back to eager for the whole
+    round, so ``compile_rounds`` compiled nothing.
+    """
+    message, state, given = Ty("message"), Ty("state"), Ty("given")
+    site = Site(
+        Signature((Orbit(message, 3, Sym.PERM),
+                   Orbit(state, traced=True), Orbit(given, traced=True))),
+        {message: 4, state: 8, given: 4},
+        {state: Mode.STATE, given: Mode.INPUT}, hidden=16)
+    relation = Relation(
+        Signature((Orbit(message, 9, Sym.PERM), )), {message: 4}, hidden=16)
+    try:
+        for cell, width in ((site, 3 * 4 + 2 * 8 + 2 * 4), (relation, 36)):
+            x = torch.randn(5, width)
+            traced = torch.compile(cell, backend="eager", fullgraph=True)
+            assert torch.equal(traced(x), cell(x))
+    finally:
+        torch._dynamo.reset()

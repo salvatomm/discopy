@@ -53,12 +53,14 @@ what the algorithm *answers* rather than of what it was sampled from:
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from functools import cached_property
 
 import numpy as np
 
-from config import ALGORITHMS, CLRS30, DATA_DIR, MIXED, SPLITS, WIDE
+from config import (ALGORITHMS, CLRS30, DATA_DIR, DEAR, DEAR_SIZES,
+                    DEAR_SPLITS, MIXED, SPLITS, WIDE)
 
 #: The probes of each algorithm, verbatim from ``clrs._src.specs.SPECS``:
 #: ``name -> (stage, location, type)``.  Copied rather than imported so
@@ -571,6 +573,204 @@ def generate(algorithm: str, split: str, log=print) -> Split:
     return found
 
 
+# --- DEAR's datasets, for Part F1 ------------------------------------------
+
+def dear_sidecar(algorithm: str):
+    """
+    Where the ``lengths`` of a DEAR cache live: a sidecar ``npz``, one
+    array per split (per size for train), read **once** by
+    :func:`dear_bound_check` and by nothing else.  No training or
+    evaluation path opens it -- ``test_clrs_f1.py`` deletes it and runs
+    both arms to pin that -- because the whole point of Part F1's regime
+    is that the per-sample step counts are information the models are
+    sold as not needing.
+    """
+    return DATA_DIR / f"{algorithm}-dear-lengths.npz"
+
+
+def _dear_chain(algorithm: str, size: int, seed: int, rng):
+    """
+    One size's sample stream, exactly DEAR's (``clrs_datasets.py``,
+    ``CLRS.get_sampler``): a ``clrs`` sampler in endless mode
+    (``num_samples=-1``) at this size, seeded with the *split's* seed,
+    drawn one sample at a time, its ``pos`` randomised by
+    ``clrs.process_random_pos`` with the **shared** split ``rng`` --
+    order of consumption matters, which is why the stream and the size
+    draws interleave on one generator -- then
+    ``clrs.process_permutations`` (a pass-through for every algorithm
+    here, none of whose probes are permutations).  Their ``min_length``
+    and ``length_needle`` kwargs are dropped by the signature filter in
+    ``build_sampler`` for these samplers, exactly as in their run.
+    """
+    import clrs
+    sampler, spec = clrs.build_sampler(
+        algorithm, num_samples=-1, length=size,
+        p=tuple(0.1 + 0.1 * i for i in range(9)), seed=seed)
+
+    def iterate():
+        while True:
+            yield sampler.next(1)
+
+    iterator = clrs.process_random_pos(iterate(), rng)
+    _, iterator = clrs.process_permutations(spec, iterator, True)
+    return iterator
+
+
+def generate_dear(algorithm: str, log=print) -> None:
+    """
+    DEAR's three splits of one algorithm (:data:`config.DEAR`), cached
+    **output-only**: per-size training files ``dear_train8`` ...
+    ``dear_train16``, ``dear_val`` and ``dear_test``, holding inputs and
+    outputs alone, with every trajectory's length in the sidecar
+    (:func:`dear_sidecar`) and the generation recorded beside the cache
+    as ``<algorithm>-dear-provenance.json``.
+
+    The sampling mirrors ``CLRS.process`` of their repository draw for
+    draw, shared-generator interleaving included: a
+    ``RandomState(seed)`` per split; per sample, a size draw
+    (``randint(n // 2, n + 1)``, train only) then one sample off that
+    size's chain (:func:`_dear_chain`); and before the real samples,
+    ``num_samples // 10`` discarded draws -- their max-length estimation
+    pass, which advances the same generators.
+
+    Parameters:
+        algorithm : The algorithm to sample.
+        log : Where to print progress.
+    """
+    import clrs
+    sidecar: dict = {}
+    provenance: dict = {"algorithm": algorithm, "source": "DEAR",
+                        "clrs": getattr(clrs, "__version__", "unknown"),
+                        "numpy": np.__version__, "splits": {}}
+    for split, setup in DEAR.items():
+        n, count, seed = setup["num_nodes"], setup["num_samples"], \
+            setup["seed"]
+        rng = np.random.RandomState(seed)
+        chains: dict = {}
+
+        def draw(split=split, n=n, seed=seed, rng=rng, chains=chains):
+            size = rng.randint(n // 2, n + 1) if split == "train" else n
+            if size not in chains:
+                chains[size] = _dear_chain(algorithm, size, seed, rng)
+            return size, next(chains[size])
+
+        for _ in range(count // 10):
+            draw()
+        drawn: dict = {}
+        for index in range(count):
+            size, feedback = draw()
+            features = feedback.features
+            drawn.setdefault(size, []).append((
+                {point.name: np.asarray(point.data)[0]
+                 for point in features.inputs},
+                {point.name: np.asarray(point.data)[0]
+                 for point in feedback.outputs},
+                int(np.asarray(features.lengths)[0])))
+            if (index + 1) % 10_000 == 0:
+                log(f"  {algorithm}/dear-{split}: {index + 1}/{count}")
+        for size in sorted(drawn):
+            inputs, outputs, lengths = zip(*drawn[size])
+            name = f"dear_train{size}" if split == "train" \
+                else f"dear_{split}"
+            stack = lambda group: {
+                key: np.stack([one[key] for one in group])
+                for key in group[0]}
+            save(Split(algorithm, name, stack(inputs), {}, stack(outputs),
+                       np.asarray(lengths, dtype=np.int64)),
+                 output_only=True)
+            sidecar[name] = np.asarray(lengths, dtype=np.int64)
+            provenance["splits"][name] = {
+                "num_samples": len(lengths), "n": size, "seed": seed,
+                "p": [round(0.1 + 0.1 * i, 1) for i in range(9)],
+                "pre_draws": count // 10, "randomise_pos": True,
+                "bytes": path_of(algorithm, name).stat().st_size}
+        log(f"  {algorithm}/dear-{split}: {count} trajectories, "
+            f"sizes {sorted(drawn)}")
+    np.savez_compressed(dear_sidecar(algorithm), **sidecar)
+    (DATA_DIR / f"{algorithm}-dear-provenance.json").write_text(
+        json.dumps(provenance, indent=2))
+
+
+def check_dear(algorithm: str, samples: int = 8, log=print) -> None:
+    """
+    Verify a DEAR cache without ``clrs`` in scope, the way :func:`check`
+    verifies the benchmark's: every split holds exactly the input and
+    output probes of :data:`SPECS` (no hints, that being the format), the
+    graph is undirected with a full diagonal and is the graph of ``A``,
+    and the outputs of the first ``samples`` trajectories per split are
+    re-decided by the reference algorithm.
+
+    Parameters:
+        algorithm : The algorithm.
+        samples : Trajectories re-decided per split.
+        log : Where to print progress.
+    """
+    for name in DEAR_SPLITS:
+        split = load(algorithm, name)
+        for stage, group in (("input", split.inputs),
+                             ("output", split.outputs)):
+            assert set(group) == set(probes(algorithm, stage)), \
+                f"{name}: {stage} probes are {sorted(group)}"
+        assert not split.hints, f"{name}: a DEAR cache stores no hints"
+        size = split.n
+        if "adj" in split.inputs:
+            adjacency = np.asarray(split.inputs["adj"]) > 0.5
+            assert np.array_equal(
+                adjacency, np.transpose(adjacency, (0, 2, 1))), \
+                f"{name}: adj is not symmetric"
+            assert adjacency[:, np.arange(size), np.arange(size)].all(), \
+                f"{name}: adj has a hole in its diagonal"
+            assert np.array_equal(
+                adjacency, (np.asarray(split.inputs["A"]) > 0)
+                | np.eye(size, dtype=bool)[None]), \
+                f"{name}: adj is not the graph of A"
+        for index in range(min(samples, len(split))):
+            for probe, found in reference(algorithm, split, index).items():
+                truth = split.outputs[probe][index]
+                if kind(algorithm, probe)[1] == "mask_one":
+                    truth = int(np.argmax(truth))
+                assert np.array_equal(truth, found), \
+                    f"{name}: {probe} disagrees with the reference " \
+                    f"on trajectory {index}"
+        log(f"  {algorithm}/{name}: {len(split)} trajectories, "
+            f"n = {size}, {min(samples, len(split))} re-decided, verified")
+
+
+def dear_bound_check(algorithm: str, log=print) -> dict:
+    """
+    The one-time bound check of Part F1, from the sidecar and from
+    nothing else: per split, the longest trajectory against the size
+    rule's premise.
+
+    The sized depth is ``model.SIZED * n = 2n`` algorithm steps; the
+    bound it rests on is that no trajectory outruns ``n`` steps -- the
+    ``2n`` rule's implied trajectory, with a factor-two slack on top.
+    Asserted here once, margins recorded, and the sidecar is never
+    touched again.
+
+    Parameters:
+        algorithm : The algorithm.
+        log : Where to print progress.
+    """
+    stored = np.load(dear_sidecar(algorithm))
+    found = {}
+    for name in stored.files:
+        lengths = stored[name]
+        size = int(name[len("dear_train"):]) \
+            if name.startswith("dear_train") else DEAR[
+                name[len("dear_"):]]["num_nodes"]
+        longest = int(lengths.max())
+        assert longest <= size, \
+            f"{name}: a trajectory of {longest} steps outruns n = {size}"
+        found[name] = {"n": size, "max_steps": longest,
+                       "margin_vs_n": size - longest,
+                       "sized_steps": 2 * size,
+                       "margin_vs_sized": 2 * size - longest}
+        log(f"  {algorithm}/{name}: max {longest} steps <= n = {size} "
+            f"(sized depth {2 * size})")
+    return found
+
+
 # --- caching ---------------------------------------------------------------
 
 def path_of(algorithm: str, split: str):
@@ -578,18 +778,39 @@ def path_of(algorithm: str, split: str):
     return DATA_DIR / f"{algorithm}-{split}.npz"
 
 
-def save(split: Split) -> None:
-    """ Cache a split as one ``npz``, one array per probe. """
-    arrays = {"lengths": split.lengths}
-    for stage, group in (("input", split.inputs), ("hint", split.hints),
-                         ("output", split.outputs)):
+def save(split: Split, output_only: bool = False) -> None:
+    """
+    Cache a split as one ``npz``, one array per probe.
+
+    Parameters:
+        split : The split to cache.
+        output_only : Whether to store the inputs and outputs alone --
+                      no hints and **no lengths** -- which is what a DEAR
+                      cache is; see :data:`config.DEAR_SPLITS`.
+    """
+    arrays = {} if output_only else {"lengths": split.lengths}
+    stages = (("input", split.inputs), ("output", split.outputs)) \
+        if output_only else (("input", split.inputs),
+                             ("hint", split.hints),
+                             ("output", split.outputs))
+    for stage, group in stages:
         for name, value in group.items():
             arrays[f"{stage}__{name}"] = np.asarray(value, dtype=np.float32)
     np.savez_compressed(path_of(split.algorithm, split.name), **arrays)
 
 
 def read(algorithm: str, split: str) -> Split:
-    """ A cached split, or ``None`` when it has not been generated. """
+    """
+    A cached split, or ``None`` when it has not been generated.
+
+    A DEAR cache (:data:`config.DEAR_SPLITS`) stores no ``lengths`` --
+    they live in the sidecar the bound check reads once -- so the field
+    is filled with a placeholder of ones.  That is safe *because* the
+    sized arms are bitwise blind to it (``test_clrs_sized.py``'s
+    poisoned-lengths gate, all-ones being literally one of the poisons),
+    and the trajectory rule is refused on this data before it could read
+    the placeholder (:func:`train.train_model`).
+    """
     path = path_of(algorithm, split)
     if not path.exists():
         return None
@@ -600,8 +821,11 @@ def read(algorithm: str, split: str) -> Split:
             continue
         stage, name = key.split("__", 1)
         groups[stage][name] = stored[key]
+    lengths = stored["lengths"].astype(np.int64) \
+        if "lengths" in stored.files else np.ones(
+            len(next(iter(groups["input"].values()))), dtype=np.int64)
     return Split(algorithm, split, groups["input"], groups["hint"],
-                 groups["output"], stored["lengths"].astype(np.int64))
+                 groups["output"], lengths)
 
 
 def load(algorithm: str, split: str) -> Split:
@@ -624,6 +848,32 @@ def load(algorithm: str, split: str) -> Split:
 def load_all(algorithm: str) -> dict:
     """ Every split of one algorithm. """
     return {split: load(algorithm, split) for split in SPLITS}
+
+
+def load_for(algorithm: str, data: str = "clrs30") -> dict:
+    """
+    The splits a budget's :attr:`~config.Budget.data` asks for, under the
+    keys the training and evaluation protocol reads: per-size training
+    splits as ``train8`` ... ``train16``, plus ``val`` and ``test``.
+
+    For ``"dear"`` those are DEAR's own splits -- ``test`` is their 100
+    trajectories at ``n = 64``, **the** split their published numbers are
+    compared on -- and ``wide`` stays this study's 128-trajectory CLRS-30
+    split at ``n = 64``, the secondary read ``PART_F1.md`` reports beside
+    it.
+
+    Parameters:
+        algorithm : The algorithm.
+        data : A member of :data:`config.DATA`.
+    """
+    if data == "clrs30":
+        return load_all(algorithm)
+    found = {f"train{size}": load(algorithm, f"dear_train{size}")
+             for size in DEAR_SIZES}
+    found["val"] = load(algorithm, "dear_val")
+    found["test"] = load(algorithm, "dear_test")
+    found["wide"] = load(algorithm, "wide")
+    return found
 
 
 # --- the reference algorithms, for verification ----------------------------
@@ -962,6 +1212,13 @@ def main(argv=None) -> int:
                         help="sample with `clrs` and cache, overwriting")
     parser.add_argument("--check", action="store_true",
                         help="verify what is cached, without `clrs`")
+    parser.add_argument("--generate-dear", action="store_true",
+                        help="sample DEAR's three splits (config.DEAR) "
+                             "with `clrs` and cache them output-only, "
+                             "with the lengths sidecar; Part F1")
+    parser.add_argument("--check-dear", action="store_true",
+                        help="verify a DEAR cache and run the one-time "
+                             "length-bound check, without `clrs`")
     parser.add_argument("--survey", action="store_true",
                         help="what the samplers draw, for all eight of "
                              "`project.md`; needs `clrs`")
@@ -977,14 +1234,28 @@ def main(argv=None) -> int:
                     print(f"  {algorithm}/{split}: cached")
                     continue
                 save(generate(algorithm, split))
+    if arguments.generate_dear:
+        check_spec()
+        for algorithm in arguments.algorithms:
+            if all(path_of(algorithm, name).exists()
+                   for name in DEAR_SPLITS):
+                print(f"  {algorithm}/dear: cached")
+                continue
+            generate_dear(algorithm)
     if arguments.check:
         for algorithm in arguments.algorithms:
             for split in arguments.splits:
                 check(load(algorithm, split), arguments.samples)
+    if arguments.check_dear:
+        for algorithm in arguments.algorithms:
+            check_dear(algorithm, arguments.samples)
+            print(json.dumps(dear_bound_check(algorithm), indent=2))
     if arguments.survey:
         tabulate(survey())
-    if not (arguments.generate or arguments.check or arguments.survey):
-        parser.error("nothing to do: pass --generate, --check or --survey")
+    if not (arguments.generate or arguments.check or arguments.survey
+            or arguments.generate_dear or arguments.check_dear):
+        parser.error("nothing to do: pass --generate, --check, --survey, "
+                     "--generate-dear or --check-dear")
     return 0
 
 
